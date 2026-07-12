@@ -1,0 +1,23 @@
+name: customer-map-platform
+label: Customer Map
+kind: platform
+version: 0.2.0
+description: Connect a user-owned Hermes Agent to Customer Map through an outbound WebSocket relay.
+author: Customer Map
+requires_env:
+  - name: CUSTOMER_MAP_HERMES_SITE
+    description: Customer Map website origin
+    prompt: Customer Map site
+    secret: false
+  - name: CUSTOMER_MAP_HERMES_BRIDGE_TOKEN
+    description: Pairing token issued by Customer Map
+    prompt: Bridge token
+    secret: true
+  - name: CUSTOMER_MAP_HERMES_CONNECTION_ID
+    description: Customer Map connection identifier
+    prompt: Connection ID
+    secret: false
+  - name: CUSTOMER_MAP_HERMES_RELAY_URL
+    description: Customer Map WebSocket relay URL
+    prompt: Relay URL
+    secret: false
