@@ -24,7 +24,7 @@ def main():
     request = urllib.request.Request(
         f"{site}/api/hermes-link",
         data=json.dumps({"action": "claim", "code": args.code, "clientId": client_id, "pluginVersion": PLUGIN_VERSION}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": f"CustomerMap-Hermes/{PLUGIN_VERSION}"},
         method="POST",
     )
     try:

@@ -4,7 +4,7 @@ kind: platform
 version: 0.2.0
 description: Connect a user-owned Hermes Agent to Customer Map through an outbound WebSocket relay.
 author: Customer Map
-requires_env:
+optional_env:
   - name: CUSTOMER_MAP_HERMES_SITE
     description: Customer Map website origin
     prompt: Customer Map site
