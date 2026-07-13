@@ -107,6 +107,65 @@ async def _check_async_final_response():
     }]
 
 
+async def _check_consecutive_session_turns():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    adapter._ws = WebSocket()
+
+    async def handle_message(event):
+        await asyncio.sleep(0.05 if event.message_id == "job-a" else 0)
+        await adapter.send(event.source.chat_id, f"final-{event.message_id}", metadata={"notify": True})
+
+    adapter.handle_message = handle_message
+    first = asyncio.create_task(adapter._run_job({"id": "job-a", "timeoutMs": 10000, "request": {"sessionId": "same-session", "input": []}}))
+    await asyncio.sleep(0.01)
+    second = asyncio.create_task(adapter._run_job({"id": "job-b", "timeoutMs": 10000, "request": {"sessionId": "same-session", "input": []}}))
+    await asyncio.gather(first, second)
+    assert [message.get("jobId") for message in adapter._ws.messages] == ["job-a", "job-b"]
+    assert all(not message.get("error") for message in adapter._ws.messages)
+
+
+async def _check_completed_turn_without_notify_flag():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    adapter._ws = WebSocket()
+    final_text = '{"reply":"done","continue":false,"actionReceipt":null}'
+
+    async def handle_message(event):
+        await adapter.send(event.source.chat_id, final_text, metadata={})
+        await adapter.on_processing_complete(event, {})
+
+    adapter.handle_message = handle_message
+    await adapter._run_job({"id": "job-no-notify", "timeoutMs": 10000, "request": {"sessionId": "session-no-notify", "input": []}})
+    assert adapter._ws.messages == [{
+        "type": "complete",
+        "jobId": "job-no-notify",
+        "response": {"output_text": final_text},
+        "error": "",
+        "pluginVersion": module.PLUGIN_VERSION,
+    }]
+
+
 async def _check_websocket_reconnect():
     module = _load_adapter()
     completed = asyncio.get_running_loop().create_future()
@@ -196,5 +255,7 @@ def _check_env_write():
 if __name__ == "__main__":
     _check_env_write()
     asyncio.run(_check_async_final_response())
+    asyncio.run(_check_consecutive_session_turns())
+    asyncio.run(_check_completed_turn_without_notify_flag())
     asyncio.run(_check_websocket_reconnect())
     print("Hermes plugin checks passed")

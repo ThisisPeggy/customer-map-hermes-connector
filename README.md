@@ -1,6 +1,8 @@
 # Customer Map for Hermes
 
-This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Background-only Hermes tasks are disabled because Customer Map currently expects one final response per request.
+This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Customer Map polls queued/running relay jobs automatically and can run another foreground turn when Hermes explicitly returns `continue: true`. A timed-out task is terminal and does not continue in the background.
+
+Version 0.2.3 also forwards the last user-facing Hermes response when a completed turn omitted the usual final-notification flag, reports the last Hermes status on timeout, and instructs mail tools to use literal body content instead of sending a temporary `/tmp/...` path as the message body.
 
 Tested with Hermes Agent v0.18.2. Users on older releases should update Hermes before installing the plugin.
 

@@ -12,7 +12,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.2.3"
 
 
 class CustomerMapAdapter(BasePlatformAdapter):
@@ -73,6 +73,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
                     "connectionId": self.connection_id,
                     "clientId": self.client_id,
                     "pluginVersion": PLUGIN_VERSION,
+                    "capabilities": _capabilities(),
                 })
                 ready = await asyncio.wait_for(self._ws.receive_json(), timeout=15)
                 if ready.get("type") != "ready":
@@ -136,11 +137,19 @@ class CustomerMapAdapter(BasePlatformAdapter):
         session_id = str(request.get("sessionId") or job_id)
         if not job_id:
             return
+        existing = self._pending.get(session_id)
+        if existing:
+            # A follow-up can reach the connector immediately after the previous
+            # final message. Give that completed turn a brief chance to release
+            # the session instead of rejecting an automatic continuation.
+            deadline = asyncio.get_running_loop().time() + 5
+            while self._pending.get(session_id) is existing and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.05)
         if session_id in self._pending:
             await self._complete(job_id, error="This Customer Map Hermes session is already processing a task.")
             return
         completion = asyncio.get_running_loop().create_future()
-        self._pending[session_id] = {"job_id": job_id, "completion": completion}
+        self._pending[session_id] = {"job_id": job_id, "completion": completion, "last_content": "", "last_metadata": {}}
         try:
             source = self.build_source(
                 chat_id=session_id,
@@ -161,7 +170,16 @@ class CustomerMapAdapter(BasePlatformAdapter):
             timeout_seconds = max(5, min(float(job.get("timeoutMs") or 120000) / 1000 - 2, 598))
             await asyncio.wait_for(completion, timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            await self._complete(job_id, error="Hermes did not return a final message before the task timed out.")
+            pending = self._pending.get(session_id) or {}
+            last_content = str(pending.get("last_content") or "").strip()
+            if _looks_like_final_response(last_content):
+                await self._complete(job_id, response={"output_text": last_content})
+            else:
+                detail = _compact_status(last_content)
+                message = "Hermes did not return a final message before the task timed out. The task has stopped and will not continue in the background."
+                if detail:
+                    message += f" Last Hermes status: {detail}"
+                await self._complete(job_id, error=message)
         except Exception as exc:
             await self._complete(job_id, error=str(exc))
         finally:
@@ -172,6 +190,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
         if not pending:
             return SendResult(success=False, error="No Customer Map job is waiting for this session")
         job_id = pending["job_id"]
+        pending["last_content"] = str(content)
+        pending["last_metadata"] = metadata if isinstance(metadata, dict) else {}
         if not isinstance(metadata, dict) or metadata.get("notify") is not True:
             return SendResult(success=True, message_id=job_id)
         if not await self._complete(job_id, response={"output_text": str(content)}):
@@ -186,8 +206,15 @@ class CustomerMapAdapter(BasePlatformAdapter):
         if not pending:
             return
         completion = pending["completion"]
+        last_content = str(pending.get("last_content") or "").strip()
+        if last_content:
+            if await self._complete(pending["job_id"], response={"output_text": last_content}):
+                if not completion.done():
+                    completion.set_result(last_content)
+                return
         if not completion.done():
-            completion.set_exception(RuntimeError("Hermes completed without returning a final text response."))
+            detail = _outcome_error(outcome)
+            completion.set_exception(RuntimeError(detail or "Hermes completed without returning a final text response."))
 
     async def send_typing(self, chat_id, metadata=None):
         return None
@@ -226,6 +253,19 @@ def _enabled():
     return all(os.getenv(name, "").strip() for name in required)
 
 
+def _capabilities():
+    return {
+        "runtime": "verified",
+        "customerMapData": "verified",
+        "sessionContext": "verified",
+        "webRead": "unknown",
+        "webSearch": "unknown",
+        "gmailDraft": "unknown",
+        "gmailSend": "unknown",
+        "memory": "unknown",
+    }
+
+
 def _env_enablement():
     return {} if _enabled() else None
 
@@ -244,5 +284,33 @@ def register(ctx):
         max_message_length=100000,
         emoji="🗺️",
         pii_safe=True,
-        platform_hint="You are serving a private Customer Map sales workspace. Return concise JSON when the task requests JSON, never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel currently supports one request and one final response.",
+        platform_hint="You are serving a private Customer Map sales workspace. Return concise JSON when the task requests JSON, never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel currently supports one request and one final response. For email tools, pass the literal email body to body/html/content parameters; never pass a temporary path such as /tmp/email_body.html as the message body. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
     )
+
+
+def _looks_like_final_response(content):
+    if not content:
+        return False
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and "reply" in parsed and ("continue" in parsed or "actionReceipt" in parsed)
+
+
+def _compact_status(content, max_length=320):
+    text = " ".join(str(content or "").split())
+    return text if len(text) <= max_length else text[:max_length - 3].rstrip() + "..."
+
+
+def _outcome_error(outcome):
+    if isinstance(outcome, dict):
+        for key in ("error", "message", "reason"):
+            value = _compact_status(outcome.get(key))
+            if value:
+                return value
+    for key in ("error", "message", "reason"):
+        value = _compact_status(getattr(outcome, key, ""))
+        if value:
+            return value
+    return ""
