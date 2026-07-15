@@ -99,6 +99,16 @@ async def _check_async_final_response():
     adapter.handle_message = handle_message
     await adapter._run_job({"id": "job-1", "timeoutMs": 10000, "request": {"sessionId": "session-1", "input": []}})
     assert adapter._ws.messages == [{
+        "type": "progress",
+        "jobId": "job-1",
+        "content": "progress",
+        "pluginVersion": module.PLUGIN_VERSION,
+    }, {
+        "type": "progress",
+        "jobId": "job-1",
+        "content": "final",
+        "pluginVersion": module.PLUGIN_VERSION,
+    }, {
         "type": "complete",
         "jobId": "job-1",
         "response": {"output_text": "final"},
@@ -131,8 +141,9 @@ async def _check_consecutive_session_turns():
     await asyncio.sleep(0.01)
     second = asyncio.create_task(adapter._run_job({"id": "job-b", "timeoutMs": 10000, "request": {"sessionId": "same-session", "input": []}}))
     await asyncio.gather(first, second)
-    assert [message.get("jobId") for message in adapter._ws.messages] == ["job-a", "job-b"]
-    assert all(not message.get("error") for message in adapter._ws.messages)
+    completed = [message for message in adapter._ws.messages if message.get("type") == "complete"]
+    assert [message.get("jobId") for message in completed] == ["job-a", "job-b"]
+    assert all(not message.get("error") for message in completed)
 
 
 async def _check_completed_turn_without_notify_flag():
@@ -158,6 +169,11 @@ async def _check_completed_turn_without_notify_flag():
     adapter.handle_message = handle_message
     await adapter._run_job({"id": "job-no-notify", "timeoutMs": 10000, "request": {"sessionId": "session-no-notify", "input": []}})
     assert adapter._ws.messages == [{
+        "type": "progress",
+        "jobId": "job-no-notify",
+        "content": final_text,
+        "pluginVersion": module.PLUGIN_VERSION,
+    }, {
         "type": "complete",
         "jobId": "job-no-notify",
         "response": {"output_text": final_text},

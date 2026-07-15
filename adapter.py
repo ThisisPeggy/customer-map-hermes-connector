@@ -12,7 +12,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.2.3"
+PLUGIN_VERSION = "0.2.4"
 
 
 class CustomerMapAdapter(BasePlatformAdapter):
@@ -192,6 +192,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
         job_id = pending["job_id"]
         pending["last_content"] = str(content)
         pending["last_metadata"] = metadata if isinstance(metadata, dict) else {}
+        await self._progress(job_id, str(content))
         if not isinstance(metadata, dict) or metadata.get("notify") is not True:
             return SendResult(success=True, message_id=job_id)
         if not await self._complete(job_id, response={"output_text": str(content)}):
@@ -226,6 +227,15 @@ class CustomerMapAdapter(BasePlatformAdapter):
         if not self._ws or self._ws.closed:
             return False
         await self._ws.send_json({"type": "complete", "jobId": job_id, "response": response, "error": error, "pluginVersion": PLUGIN_VERSION})
+        return True
+
+    async def _progress(self, job_id, content):
+        if not self._ws or self._ws.closed:
+            return False
+        text = str(content or "").strip()
+        if not text:
+            return True
+        await self._ws.send_json({"type": "progress", "jobId": job_id, "content": text[:100000], "pluginVersion": PLUGIN_VERSION})
         return True
 
     def _fail_pending(self, message):
