@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 import uuid
 
-PLUGIN_VERSION = "0.2.4"
+PLUGIN_VERSION = "0.2.5"
 
 
 def main():

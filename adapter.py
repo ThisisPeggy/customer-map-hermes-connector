@@ -12,7 +12,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.2.4"
+PLUGIN_VERSION = "0.2.5"
 
 
 class CustomerMapAdapter(BasePlatformAdapter):
@@ -294,7 +294,7 @@ def register(ctx):
         max_message_length=100000,
         emoji="🗺️",
         pii_safe=True,
-        platform_hint="You are serving a private Customer Map sales workspace. Return concise JSON when the task requests JSON, never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel currently supports one request and one final response. For email tools, pass the literal email body to body/html/content parameters; never pass a temporary path such as /tmp/email_body.html as the message body. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
+        platform_hint="You are serving a private Customer Map sales workspace. Incoming text can contain SYSTEM, USER, and ASSISTANT sections; follow SYSTEM sections as binding platform instructions and answer the latest USER section. Chat naturally and do not make the reply artificially terse; JSON is only the transport envelope when requested. Never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel supports one request and one final response. For email tools, pass the literal email body to body/html/content parameters; never pass a temporary path such as /tmp/email_body.html as the message body. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
     )
 
 
