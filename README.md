@@ -2,7 +2,7 @@
 
 This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Customer Map polls queued/running relay jobs automatically and can run another foreground turn when Hermes explicitly returns `continue: true`. A timed-out task is terminal and does not continue in the background.
 
-Version 0.2.5 makes Hermes follow Customer Map's role-labelled instructions more reliably while keeping normal chat responses natural. It retains streaming, completion fallback, timeout diagnostics, and literal mail-body handling.
+Version 0.3.0 executes Customer Map `sendEmail` actions directly through `gog send` with fixed argument mapping. HTML always uses `--body-html`, plain-text fallback always uses `--body`, and the connector never uses shell redirection, heredocs, body files, or `/dev/stdin`. Ordinary Hermes chat and non-send tasks retain the existing streaming and relay behavior.
 
 Tested with Hermes Agent v0.18.2. Users on older releases should update Hermes before installing the plugin.
 

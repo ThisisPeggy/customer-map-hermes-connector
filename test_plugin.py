@@ -3,6 +3,7 @@
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -182,6 +183,103 @@ async def _check_completed_turn_without_notify_flag():
     }]
 
 
+async def _check_direct_gog_send_action():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    recipient = "buyer@example.com"
+    subject = "HTML table"
+    plain_text = "Model | Price"
+    html_body = "<table><tr><td>Model</td><td>Price</td></tr></table>"
+    body_hash = module._mail_body_hash(recipient, subject, plain_text, html_body)
+    action = {
+        "version": 1,
+        "actionId": "a" * 32,
+        "kind": "sendEmail",
+        "account": "sender@example.com",
+        "recipient": recipient,
+        "subject": subject,
+        "plainTextBody": plain_text,
+        "htmlBody": html_body,
+        "bodyHash": body_hash,
+    }
+    captured = {}
+
+    async def execute(value):
+        captured.update(value)
+        return module._mail_action_result(
+            value,
+            "succeeded",
+            message_id="message-123",
+            tool_version="0.11.0",
+            exit_code=0,
+        )
+
+    async def reject_model_call(_event):
+        raise AssertionError("Direct mail actions must bypass Hermes model execution")
+
+    module._execute_gog_send = execute
+    adapter.handle_message = reject_model_call
+    adapter._ws = WebSocket()
+    await adapter._run_job({
+        "id": "job-mail",
+        "timeoutMs": 10000,
+        "request": {
+            "sessionId": "mail-action-session",
+            "input": [],
+            "mailAction": action,
+        },
+    })
+    assert captured["htmlBody"] == html_body
+    complete = adapter._ws.messages[-1]
+    payload = json.loads(complete["response"]["output_text"])
+    receipt = payload["actionReceipt"]
+    assert receipt["status"] == "succeeded"
+    assert receipt["messageId"] == "message-123"
+    assert receipt["bodyMode"] == "body-html+body"
+    assert receipt["tool"] == "gog"
+
+    args = module._build_gog_send_args(captured)
+    assert any(value.startswith("--body-html=") for value in args)
+    assert any(value.startswith("--body=") for value in args)
+    assert not any("body-file" in value or "/dev/stdin" in value for value in args)
+
+
+async def _check_rejects_stdin_body():
+    module = _load_adapter()
+    action = {
+        "version": 1,
+        "actionId": "b" * 32,
+        "kind": "sendEmail",
+        "account": "sender@example.com",
+        "recipient": "buyer@example.com",
+        "subject": "Unsafe body",
+        "plainTextBody": "/dev/stdin",
+        "htmlBody": "",
+    }
+    action["bodyHash"] = module._mail_body_hash(
+        action["recipient"],
+        action["subject"],
+        action["plainTextBody"],
+        action["htmlBody"],
+    )
+    try:
+        module._normalize_mail_action(action)
+    except ValueError as exc:
+        assert "filesystem or stdin path" in str(exc)
+    else:
+        raise AssertionError("/dev/stdin must be rejected as an email body")
+
+
 async def _check_websocket_reconnect():
     module = _load_adapter()
     completed = asyncio.get_running_loop().create_future()
@@ -273,5 +371,7 @@ if __name__ == "__main__":
     asyncio.run(_check_async_final_response())
     asyncio.run(_check_consecutive_session_turns())
     asyncio.run(_check_completed_turn_without_notify_flag())
+    asyncio.run(_check_direct_gog_send_action())
+    asyncio.run(_check_rejects_stdin_body())
     asyncio.run(_check_websocket_reconnect())
     print("Hermes plugin checks passed")

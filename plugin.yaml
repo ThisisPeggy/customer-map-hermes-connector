@@ -1,7 +1,7 @@
 name: customer-map-platform
 label: Customer Map
 kind: platform
-version: 0.2.5
+version: 0.3.0
 description: Connect a user-owned Hermes Agent to Customer Map through an outbound WebSocket relay.
 author: Customer Map
 optional_env:

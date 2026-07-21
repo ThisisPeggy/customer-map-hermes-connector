@@ -1,18 +1,23 @@
 """Hermes platform plugin for Customer Map's outbound WebSocket relay."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.2.5"
+PLUGIN_VERSION = "0.3.0"
+MIN_GOG_VERSION = (0, 11, 0)
+MAX_GOG_BODY_BYTES = 100000
+_GOG_VERSION_CACHE = None
 
 
 class CustomerMapAdapter(BasePlatformAdapter):
@@ -33,6 +38,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
         self._connect_lock = asyncio.Lock()
         self._pending = {}
         self._job_tasks = set()
+        self._mail_action_results = {}
 
     @property
     def name(self):
@@ -151,6 +157,14 @@ class CustomerMapAdapter(BasePlatformAdapter):
         completion = asyncio.get_running_loop().create_future()
         self._pending[session_id] = {"job_id": job_id, "completion": completion, "last_content": "", "last_metadata": {}}
         try:
+            if request.get("mailAction") is not None:
+                response = await self._run_direct_mail_action(request.get("mailAction"))
+                output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                if not await self._complete(job_id, response={"output_text": output_text}):
+                    raise ConnectionError("Customer Map relay is disconnected")
+                if not completion.done():
+                    completion.set_result(output_text)
+                return
             source = self.build_source(
                 chat_id=session_id,
                 chat_name="Customer Map",
@@ -184,6 +198,22 @@ class CustomerMapAdapter(BasePlatformAdapter):
             await self._complete(job_id, error=str(exc))
         finally:
             self._pending.pop(session_id, None)
+
+    async def _run_direct_mail_action(self, value):
+        try:
+            action = _normalize_mail_action(value)
+        except ValueError as exc:
+            return _mail_action_result(value, "failed", error=str(exc))
+        cached = self._mail_action_results.get(action["actionId"])
+        if cached:
+            if cached["bodyHash"] != action["bodyHash"]:
+                return _mail_action_result(action, "failed", error="Mail action id was reused with different content.")
+            return cached["result"]
+        result = await _execute_gog_send(action)
+        self._mail_action_results[action["actionId"]] = {"bodyHash": action["bodyHash"], "result": result}
+        while len(self._mail_action_results) > 200:
+            self._mail_action_results.pop(next(iter(self._mail_action_results)))
+        return result
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         pending = self._pending.get(str(chat_id))
@@ -271,7 +301,7 @@ def _capabilities():
         "webRead": "unknown",
         "webSearch": "unknown",
         "gmailDraft": "unknown",
-        "gmailSend": "unknown",
+        "gmailSend": "declared",
         "memory": "unknown",
     }
 
@@ -294,8 +324,259 @@ def register(ctx):
         max_message_length=100000,
         emoji="🗺️",
         pii_safe=True,
-        platform_hint="You are serving a private Customer Map sales workspace. Incoming text can contain SYSTEM, USER, and ASSISTANT sections; follow SYSTEM sections as binding platform instructions and answer the latest USER section. Chat naturally and do not make the reply artificially terse; JSON is only the transport envelope when requested. Never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel supports one request and one final response. For email tools, pass the literal email body to body/html/content parameters; never pass a temporary path such as /tmp/email_body.html as the message body. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
+        platform_hint="You are serving a private Customer Map sales workspace. Incoming text can contain SYSTEM, USER, and ASSISTANT sections; follow SYSTEM sections as binding platform instructions and answer the latest USER section. Chat naturally and do not make the reply artificially terse; JSON is only the transport envelope when requested. Never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel supports one request and one final response. Customer Map sendEmail actions are executed deterministically by the connector and must not be repeated through another mail tool. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
     )
+
+
+def _normalize_mail_action(value):
+    if not isinstance(value, dict):
+        raise ValueError("Invalid Customer Map mail action.")
+    if value.get("version") != 1 or value.get("kind") != "sendEmail":
+        raise ValueError("Unsupported Customer Map mail action version or kind.")
+    action_id = str(value.get("actionId") or "").strip().lower()
+    account = str(value.get("account") or "").strip().lower()
+    recipient = str(value.get("recipient") or "").strip().lower()
+    subject = str(value.get("subject") or "").strip()
+    plain_text = str(value.get("plainTextBody") or "")
+    html_body = str(value.get("htmlBody") or "")
+    body_hash = str(value.get("bodyHash") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", action_id):
+        raise ValueError("Invalid Customer Map mail action id.")
+    if not _valid_email(account) or not _valid_email(recipient):
+        raise ValueError("Invalid Gmail account or recipient.")
+    if not subject or "\r" in subject or "\n" in subject:
+        raise ValueError("Invalid email subject.")
+    if not plain_text and not html_body:
+        raise ValueError("Email body is empty.")
+    if _looks_like_body_path(plain_text) or _looks_like_body_path(html_body):
+        raise ValueError("Email body cannot be a filesystem or stdin path.")
+    if len(plain_text.encode("utf-8")) > MAX_GOG_BODY_BYTES or len(html_body.encode("utf-8")) > MAX_GOG_BODY_BYTES:
+        raise ValueError("Email body is too large for safe gog argument execution.")
+    if not html_body and _contains_markdown_table(plain_text):
+        raise ValueError("Markdown table requires an HTML body before sending.")
+    expected_hash = _mail_body_hash(recipient, subject, plain_text, html_body)
+    if body_hash != expected_hash:
+        raise ValueError("Email body integrity check failed.")
+    return {
+        "actionId": action_id,
+        "account": account,
+        "recipient": recipient,
+        "subject": subject,
+        "plainTextBody": plain_text,
+        "htmlBody": html_body,
+        "bodyHash": body_hash,
+    }
+
+
+async def _execute_gog_send(action):
+    try:
+        gog_version = await _read_gog_version()
+    except Exception as exc:
+        return _mail_action_result(action, "failed", error=f"gog is unavailable or unsupported: {_compact_status(exc)}")
+    args = _build_gog_send_args(action)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=90)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return _mail_action_result(
+                action,
+                "needsConfirmation",
+                error="gog send timed out; check Gmail Sent before retrying.",
+                tool_version=gog_version,
+            )
+    except FileNotFoundError:
+        return _mail_action_result(action, "failed", error="gog executable was not found.", tool_version=gog_version)
+    except Exception as exc:
+        return _mail_action_result(action, "needsConfirmation", error=f"gog send could not be confirmed: {_compact_status(exc)}", tool_version=gog_version)
+    output = stdout.decode("utf-8", errors="replace").strip()
+    message_id = _extract_message_id(output)
+    if process.returncode == 0 and message_id:
+        logger.info(
+            "Customer Map gog send succeeded action=%s mode=%s message=%s",
+            action["actionId"],
+            _body_mode(action),
+            message_id,
+        )
+        return _mail_action_result(
+            action,
+            "succeeded",
+            message_id=message_id,
+            tool_version=gog_version,
+            exit_code=process.returncode,
+        )
+    if process.returncode == 0:
+        return _mail_action_result(
+            action,
+            "needsConfirmation",
+            error="gog returned success without a verifiable Gmail message id; check Gmail Sent before retrying.",
+            tool_version=gog_version,
+            exit_code=process.returncode,
+        )
+    logger.warning("Customer Map gog send failed action=%s exit=%s", action["actionId"], process.returncode)
+    return _mail_action_result(
+        action,
+        "failed",
+        error=f"gog send failed with exit code {process.returncode}.",
+        tool_version=gog_version,
+        exit_code=process.returncode,
+    )
+
+
+def _build_gog_send_args(action):
+    args = [
+        "gog",
+        "send",
+        f"--to={action['recipient']}",
+        f"--subject={action['subject']}",
+    ]
+    if action["htmlBody"]:
+        args.append(f"--body-html={action['htmlBody']}")
+    if action["plainTextBody"]:
+        args.append(f"--body={action['plainTextBody']}")
+    args.extend([
+        f"--account={action['account']}",
+        "--force",
+        "--json",
+    ])
+    return args
+
+
+async def _read_gog_version():
+    global _GOG_VERSION_CACHE
+    if _GOG_VERSION_CACHE:
+        return _GOG_VERSION_CACHE
+    process = await asyncio.create_subprocess_exec(
+        "gog",
+        "--version",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+    text = (stdout or stderr).decode("utf-8", errors="replace")
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", text)
+    if process.returncode != 0 or not match:
+        raise RuntimeError("unable to read gog version")
+    version_tuple = tuple(int(part) for part in match.groups())
+    if version_tuple < MIN_GOG_VERSION:
+        raise RuntimeError(f"gog v{'.'.join(match.groups())} is older than v0.11.0")
+    _GOG_VERSION_CACHE = ".".join(match.groups())
+    return _GOG_VERSION_CACHE
+
+
+def _mail_action_result(value, status, message_id="", error="", tool_version="", exit_code=None):
+    source = value if isinstance(value, dict) else {}
+    recipient = str(source.get("recipient") or "").strip().lower()
+    action_id = str(source.get("actionId") or "").strip().lower()
+    body_hash = str(source.get("bodyHash") or "").strip().lower()
+    receipt = {
+        "kind": "sendEmail",
+        "status": status,
+        "provider": "gmail",
+        "messageId": message_id,
+        "recipient": recipient,
+        "occurredAt": datetime.now(timezone.utc).isoformat() if status == "succeeded" else "",
+        "error": error,
+        "tool": "gog",
+        "toolVersion": tool_version,
+        "bodyMode": _body_mode(source),
+        "bodyHash": body_hash,
+        "actionId": action_id,
+        "exitCode": exit_code,
+    }
+    return {
+        "reply": "邮件已通过 Hermes gog 发送。" if status == "succeeded" else error,
+        "subject": "",
+        "sendText": "",
+        "tag": "",
+        "aiNote": "",
+        "continue": False,
+        "actionReceipt": receipt,
+    }
+
+
+def _extract_message_id(text):
+    if not text:
+        return ""
+    candidates = []
+    try:
+        candidates.append(json.loads(text))
+    except (TypeError, ValueError):
+        for line in reversed(text.splitlines()):
+            try:
+                candidates.append(json.loads(line))
+                break
+            except (TypeError, ValueError):
+                continue
+    for value in candidates:
+        found = _find_message_id(value)
+        if found:
+            return found
+    match = re.search(r'"(?:messageId|message_id)"\s*:\s*"([^"\s]{6,})"', text)
+    return match.group(1) if match else ""
+
+
+def _find_message_id(value):
+    if isinstance(value, dict):
+        for key in ("messageId", "message_id", "id"):
+            candidate = str(value.get(key) or "").strip()
+            if len(candidate) >= 6:
+                return candidate
+        for child in value.values():
+            found = _find_message_id(child)
+            if found:
+                return found
+    if isinstance(value, list):
+        for child in value:
+            found = _find_message_id(child)
+            if found:
+                return found
+    return ""
+
+
+def _body_mode(value):
+    if not isinstance(value, dict):
+        return ""
+    has_html = bool(value.get("htmlBody"))
+    has_plain = bool(value.get("plainTextBody"))
+    if has_html and has_plain:
+        return "body-html+body"
+    if has_html:
+        return "body-html"
+    if has_plain:
+        return "body"
+    return ""
+
+
+def _mail_body_hash(recipient, subject, plain_text, html_body):
+    digest = hashlib.sha256()
+    values = (recipient, subject, plain_text, html_body)
+    for index, value in enumerate(values):
+        digest.update(str(value).encode("utf-8"))
+        if index < len(values) - 1:
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _valid_email(value):
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value or ""))
+
+
+def _looks_like_body_path(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(re.fullmatch(r"(?:/dev/stdin|/tmp/\S+|[A-Za-z]:\\\S+|file://\S+)", text, re.IGNORECASE))
+
+
+def _contains_markdown_table(value):
+    return bool(re.search(r"(?:^|\n)\s*\|?.+\|.+\n\s*\|?\s*:?-{3,}", str(value or "")))
 
 
 def _looks_like_final_response(content):
