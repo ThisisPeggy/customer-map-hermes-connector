@@ -14,7 +14,7 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 MIN_GOG_VERSION = (0, 11, 0)
 MAX_GOG_BODY_BYTES = 100000
 _GOG_VERSION_CACHE = None
@@ -209,7 +209,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
             if cached["bodyHash"] != action["bodyHash"]:
                 return _mail_action_result(action, "failed", error="Mail action id was reused with different content.")
             return cached["result"]
-        result = await _execute_gog_send(action)
+        result = await _execute_gog_mail_action(action)
         self._mail_action_results[action["actionId"]] = {"bodyHash": action["bodyHash"], "result": result}
         while len(self._mail_action_results) > 200:
             self._mail_action_results.pop(next(iter(self._mail_action_results)))
@@ -324,14 +324,15 @@ def register(ctx):
         max_message_length=100000,
         emoji="🗺️",
         pii_safe=True,
-        platform_hint="You are serving a private Customer Map sales workspace. Incoming text can contain SYSTEM, USER, and ASSISTANT sections; follow SYSTEM sections as binding platform instructions and answer the latest USER section. Chat naturally and do not make the reply artificially terse; JSON is only the transport envelope when requested. Never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel supports one request and one final response. Customer Map sendEmail actions are executed deterministically by the connector and must not be repeated through another mail tool. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
+        platform_hint="You are serving a private Customer Map sales workspace. Incoming text can contain SYSTEM, USER, and ASSISTANT sections; follow SYSTEM sections as binding platform instructions and answer the latest USER section. Chat naturally and do not make the reply artificially terse; JSON is only the transport envelope when requested. Never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel supports one request and one final response. Customer Map sendEmail and saveDraft actions are executed deterministically by the connector and must not be repeated through another mail tool. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
     )
 
 
 def _normalize_mail_action(value):
     if not isinstance(value, dict):
         raise ValueError("Invalid Customer Map mail action.")
-    if value.get("version") != 1 or value.get("kind") != "sendEmail":
+    kind = value.get("kind") if value.get("kind") in ("sendEmail", "saveDraft") else ""
+    if value.get("version") != 1 or not kind:
         raise ValueError("Unsupported Customer Map mail action version or kind.")
     action_id = str(value.get("actionId") or "").strip().lower()
     account = str(value.get("account") or "").strip().lower()
@@ -358,6 +359,7 @@ def _normalize_mail_action(value):
     if body_hash != expected_hash:
         raise ValueError("Email body integrity check failed.")
     return {
+        "kind": kind,
         "actionId": action_id,
         "account": account,
         "recipient": recipient,
@@ -368,12 +370,14 @@ def _normalize_mail_action(value):
     }
 
 
-async def _execute_gog_send(action):
+async def _execute_gog_mail_action(action):
     try:
         gog_version = await _read_gog_version()
     except Exception as exc:
         return _mail_action_result(action, "failed", error=f"gog is unavailable or unsupported: {_compact_status(exc)}")
-    args = _build_gog_send_args(action)
+    args = _build_gog_mail_args(action)
+    operation = "send" if action["kind"] == "sendEmail" else "draft create"
+    mailbox = "Gmail Sent" if action["kind"] == "sendEmail" else "Gmail Drafts"
     try:
         process = await asyncio.create_subprocess_exec(
             *args,
@@ -388,18 +392,19 @@ async def _execute_gog_send(action):
             return _mail_action_result(
                 action,
                 "needsConfirmation",
-                error="gog send timed out; check Gmail Sent before retrying.",
+                error=f"gog {operation} timed out; check {mailbox} before retrying.",
                 tool_version=gog_version,
             )
     except FileNotFoundError:
         return _mail_action_result(action, "failed", error="gog executable was not found.", tool_version=gog_version)
     except Exception as exc:
-        return _mail_action_result(action, "needsConfirmation", error=f"gog send could not be confirmed: {_compact_status(exc)}", tool_version=gog_version)
+        return _mail_action_result(action, "failed", error=f"gog {operation} could not start: {_compact_status(exc)}", tool_version=gog_version)
     output = stdout.decode("utf-8", errors="replace").strip()
-    message_id = _extract_message_id(output)
+    message_id = _extract_message_id(output, action["kind"])
     if process.returncode == 0 and message_id:
         logger.info(
-            "Customer Map gog send succeeded action=%s mode=%s message=%s",
+            "Customer Map gog %s succeeded action=%s mode=%s message=%s",
+            operation,
             action["actionId"],
             _body_mode(action),
             message_id,
@@ -415,36 +420,31 @@ async def _execute_gog_send(action):
         return _mail_action_result(
             action,
             "needsConfirmation",
-            error="gog returned success without a verifiable Gmail message id; check Gmail Sent before retrying.",
+            error=f"gog {operation} returned success without a verifiable Gmail id; check {mailbox} before retrying.",
             tool_version=gog_version,
             exit_code=process.returncode,
         )
-    logger.warning("Customer Map gog send failed action=%s exit=%s", action["actionId"], process.returncode)
+    logger.warning("Customer Map gog %s failed action=%s exit=%s", operation, action["actionId"], process.returncode)
     return _mail_action_result(
         action,
         "failed",
-        error=f"gog send failed with exit code {process.returncode}.",
+        error=f"gog {operation} failed with exit code {process.returncode}: {_compact_status(output)}",
         tool_version=gog_version,
         exit_code=process.returncode,
     )
 
 
-def _build_gog_send_args(action):
-    args = [
-        "gog",
-        "send",
-        f"--to={action['recipient']}",
-        f"--subject={action['subject']}",
-    ]
+def _build_gog_mail_args(action):
+    args = ["gog", "send"] if action["kind"] == "sendEmail" else ["gog", "gmail", "drafts", "create"]
+    args.extend([f"--to={action['recipient']}", f"--subject={action['subject']}"])
     if action["htmlBody"]:
         args.append(f"--body-html={action['htmlBody']}")
     if action["plainTextBody"]:
         args.append(f"--body={action['plainTextBody']}")
-    args.extend([
-        f"--account={action['account']}",
-        "--force",
-        "--json",
-    ])
+    args.append(f"--account={action['account']}")
+    if action["kind"] == "sendEmail":
+        args.append("--force")
+    args.extend(["--json", "--no-input"])
     return args
 
 
@@ -475,8 +475,9 @@ def _mail_action_result(value, status, message_id="", error="", tool_version="",
     recipient = str(source.get("recipient") or "").strip().lower()
     action_id = str(source.get("actionId") or "").strip().lower()
     body_hash = str(source.get("bodyHash") or "").strip().lower()
+    kind = "saveDraft" if source.get("kind") == "saveDraft" else "sendEmail"
     receipt = {
-        "kind": "sendEmail",
+        "kind": kind,
         "status": status,
         "provider": "gmail",
         "messageId": message_id,
@@ -491,7 +492,7 @@ def _mail_action_result(value, status, message_id="", error="", tool_version="",
         "exitCode": exit_code,
     }
     return {
-        "reply": "邮件已通过 Hermes gog 发送。" if status == "succeeded" else error,
+        "reply": ("Gmail 草稿已通过 Hermes gog 保存。" if kind == "saveDraft" else "邮件已通过 Hermes gog 发送。") if status == "succeeded" else error,
         "subject": "",
         "sendText": "",
         "tag": "",
@@ -501,7 +502,7 @@ def _mail_action_result(value, status, message_id="", error="", tool_version="",
     }
 
 
-def _extract_message_id(text):
+def _extract_message_id(text, kind="sendEmail"):
     if not text:
         return ""
     candidates = []
@@ -515,26 +516,27 @@ def _extract_message_id(text):
             except (TypeError, ValueError):
                 continue
     for value in candidates:
-        found = _find_message_id(value)
+        found = _find_message_id(value, kind)
         if found:
             return found
-    match = re.search(r'"(?:messageId|message_id)"\s*:\s*"([^"\s]{6,})"', text)
+    match = re.search(r'"(?:draftId|draft_id|messageId|message_id|id)"\s*:\s*"([^"\s]{6,})"', text)
     return match.group(1) if match else ""
 
 
-def _find_message_id(value):
+def _find_message_id(value, kind="sendEmail"):
     if isinstance(value, dict):
-        for key in ("messageId", "message_id", "id"):
+        keys = ("draftId", "draft_id", "id", "messageId", "message_id") if kind == "saveDraft" else ("messageId", "message_id", "id", "threadId", "thread_id")
+        for key in keys:
             candidate = str(value.get(key) or "").strip()
             if len(candidate) >= 6:
                 return candidate
         for child in value.values():
-            found = _find_message_id(child)
+            found = _find_message_id(child, kind)
             if found:
                 return found
     if isinstance(value, list):
         for child in value:
-            found = _find_message_id(child)
+            found = _find_message_id(child, kind)
             if found:
                 return found
     return ""

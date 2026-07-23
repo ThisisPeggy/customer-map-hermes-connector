@@ -227,7 +227,7 @@ async def _check_direct_gog_send_action():
     async def reject_model_call(_event):
         raise AssertionError("Direct mail actions must bypass Hermes model execution")
 
-    module._execute_gog_send = execute
+    module._execute_gog_mail_action = execute
     adapter.handle_message = reject_model_call
     adapter._ws = WebSocket()
     await adapter._run_job({
@@ -248,10 +248,39 @@ async def _check_direct_gog_send_action():
     assert receipt["bodyMode"] == "body-html+body"
     assert receipt["tool"] == "gog"
 
-    args = module._build_gog_send_args(captured)
+    args = module._build_gog_mail_args(captured)
     assert any(value.startswith("--body-html=") for value in args)
     assert any(value.startswith("--body=") for value in args)
+    assert "--no-input" in args
     assert not any("body-file" in value or "/dev/stdin" in value for value in args)
+
+
+async def _check_direct_gog_draft_action():
+    module = _load_adapter()
+    recipient = "buyer@example.com"
+    subject = "Draft price list"
+    plain_text = "Draft body"
+    html_body = ""
+    action = {
+        "version": 1,
+        "actionId": "d" * 32,
+        "kind": "saveDraft",
+        "account": "sender@example.com",
+        "recipient": recipient,
+        "subject": subject,
+        "plainTextBody": plain_text,
+        "htmlBody": html_body,
+        "bodyHash": module._mail_body_hash(recipient, subject, plain_text, html_body),
+    }
+    normalized = module._normalize_mail_action(action)
+    assert normalized["kind"] == "saveDraft"
+    args = module._build_gog_mail_args(normalized)
+    assert args[:4] == ["gog", "gmail", "drafts", "create"]
+    assert "--force" not in args
+    assert "--json" in args and "--no-input" in args
+    result = module._mail_action_result(normalized, "succeeded", message_id="draft-123456", tool_version="0.11.0", exit_code=0)
+    assert result["actionReceipt"]["kind"] == "saveDraft"
+    assert result["actionReceipt"]["messageId"] == "draft-123456"
 
 
 async def _check_rejects_stdin_body():
@@ -372,6 +401,7 @@ if __name__ == "__main__":
     asyncio.run(_check_consecutive_session_turns())
     asyncio.run(_check_completed_turn_without_notify_flag())
     asyncio.run(_check_direct_gog_send_action())
+    asyncio.run(_check_direct_gog_draft_action())
     asyncio.run(_check_rejects_stdin_body())
     asyncio.run(_check_websocket_reconnect())
     print("Hermes plugin checks passed")
