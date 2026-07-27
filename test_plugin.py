@@ -118,6 +118,51 @@ async def _check_async_final_response():
     }]
 
 
+async def _check_unsupported_home_channel_notice_is_suppressed():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    adapter._ws = WebSocket()
+    notice = (
+        "\U0001F4EC No home channel is set for Customer_Map. "
+        "A home channel is where Hermes delivers cron job results and cross-platform messages.\n\n"
+        "Type /sethome to make this chat your home channel, or ignore to skip."
+    )
+
+    async def handle_message(event):
+        result = await adapter.send(event.source.chat_id, notice, metadata={})
+        assert result.success
+        await adapter.send(event.source.chat_id, "final", metadata={"notify": True})
+
+    adapter.handle_message = handle_message
+    await adapter._run_job({
+        "id": "job-home-channel",
+        "timeoutMs": 10000,
+        "request": {"sessionId": "session-home-channel", "input": []},
+    })
+    assert adapter._ws.messages == [{
+        "type": "progress",
+        "jobId": "job-home-channel",
+        "content": "final",
+        "pluginVersion": module.PLUGIN_VERSION,
+    }, {
+        "type": "complete",
+        "jobId": "job-home-channel",
+        "response": {"output_text": "final"},
+        "error": "",
+        "pluginVersion": module.PLUGIN_VERSION,
+    }]
+
+
 async def _check_consecutive_session_turns():
     module = _load_adapter()
     adapter = module.CustomerMapAdapter({})
@@ -398,6 +443,7 @@ def _check_env_write():
 if __name__ == "__main__":
     _check_env_write()
     asyncio.run(_check_async_final_response())
+    asyncio.run(_check_unsupported_home_channel_notice_is_suppressed())
     asyncio.run(_check_consecutive_session_turns())
     asyncio.run(_check_completed_turn_without_notify_flag())
     asyncio.run(_check_direct_gog_send_action())

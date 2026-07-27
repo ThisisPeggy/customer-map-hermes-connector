@@ -14,10 +14,17 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 MIN_GOG_VERSION = (0, 11, 0)
 MAX_GOG_BODY_BYTES = 100000
 _GOG_VERSION_CACHE = None
+_UNSUPPORTED_HOME_CHANNEL_NOTICE_RE = re.compile(
+    r"^(?:\U0001F4EC\s*)?No home channel is set for Customer[_ ]Map\.\s+"
+    r"A home channel is where Hermes delivers cron job results and cross-platform messages\.\s+"
+    r"Type (?:/hermes\s+sethome|/sethome) to make this chat your home channel,\s+"
+    r"or ignore to skip\.?$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class CustomerMapAdapter(BasePlatformAdapter):
@@ -220,6 +227,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
         if not pending:
             return SendResult(success=False, error="No Customer Map job is waiting for this session")
         job_id = pending["job_id"]
+        if _is_unsupported_home_channel_notice(content):
+            return SendResult(success=True, message_id=job_id)
         pending["last_content"] = str(content)
         pending["last_metadata"] = metadata if isinstance(metadata, dict) else {}
         await self._progress(job_id, str(content))
@@ -286,6 +295,10 @@ def _request_text(value):
         if content:
             parts.append(f"{role}:\n{content}")
     return "\n\n".join(parts) or "Respond to the Customer Map task."
+
+
+def _is_unsupported_home_channel_notice(value):
+    return bool(_UNSUPPORTED_HOME_CHANNEL_NOTICE_RE.fullmatch(str(value or "").strip()))
 
 
 def _enabled():
