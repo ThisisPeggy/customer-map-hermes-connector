@@ -1,7 +1,7 @@
 name: customer-map-platform
 label: Customer Map
 kind: platform
-version: 0.4.0
+version: 0.5.0
 description: Connect a user-owned Hermes Agent to Customer Map through an outbound WebSocket relay.
 author: Customer Map
 optional_env:
@@ -20,4 +20,20 @@ optional_env:
   - name: CUSTOMER_MAP_HERMES_RELAY_URL
     description: Customer Map WebSocket relay URL
     prompt: Relay URL
+    secret: false
+  - name: CUSTOMER_MAP_HERMES_MAIL_BACKEND
+    description: Deterministic mail backend (gog or himalaya; defaults to gog)
+    prompt: Mail backend
+    secret: false
+  - name: CUSTOMER_MAP_HERMES_HIMALAYA_ACCOUNT
+    description: Optional Himalaya account name
+    prompt: Himalaya account
+    secret: false
+  - name: CUSTOMER_MAP_HERMES_HIMALAYA_DRAFT_MAILBOX
+    description: Himalaya draft mailbox or alias (defaults to Drafts)
+    prompt: Himalaya draft mailbox
+    secret: false
+  - name: CUSTOMER_MAP_HERMES_HIMALAYA_CONFIG
+    description: Optional Himalaya config file path
+    prompt: Himalaya config path
     secret: false

@@ -13,6 +13,9 @@ from types import SimpleNamespace
 from aiohttp import web
 
 ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
+
+import mail_backends
 
 
 def _load_adapter():
@@ -20,6 +23,12 @@ def _load_adapter():
     config = types.ModuleType("gateway.config")
     platforms = types.ModuleType("gateway.platforms")
     base = types.ModuleType("gateway.platforms.base")
+    gateway_run = types.ModuleType("gateway.run")
+    hermes_cli = types.ModuleType("hermes_cli")
+    tools_config = types.ModuleType("hermes_cli.tools_config")
+    toolsets = types.ModuleType("toolsets")
+    toolsets.TOOLSETS = {}
+    toolsets.resolve_toolset = lambda name: ["web_search", "web_extract"] if name == "web" else []
 
     class Platform(str):
         @property
@@ -62,11 +71,18 @@ def _load_adapter():
     base.MessageEvent = MessageEvent
     base.MessageType = MessageType
     base.SendResult = SendResult
+    gateway_run._load_gateway_config = lambda: {"platform_toolsets": {"customer_map": ["web", "no_mcp"]}}
+    tools_config._get_platform_tools = lambda _config, _platform: {"web"}
+    tools_config._get_plugin_toolset_keys = lambda: set()
     sys.modules.update({
         "gateway": gateway,
         "gateway.config": config,
         "gateway.platforms": platforms,
         "gateway.platforms.base": base,
+        "gateway.run": gateway_run,
+        "hermes_cli": hermes_cli,
+        "hermes_cli.tools_config": tools_config,
+        "toolsets": toolsets,
     })
     spec = importlib.util.spec_from_file_location("customer_map_adapter_test", ROOT / "adapter.py")
     module = importlib.util.module_from_spec(spec)
@@ -185,6 +201,9 @@ async def _check_completed_turn_without_notify_flag():
 
 async def _check_direct_gog_send_action():
     module = _load_adapter()
+    temporary_home = tempfile.TemporaryDirectory()
+    previous_home = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = temporary_home.name
     adapter = module.CustomerMapAdapter({})
 
     class WebSocket:
@@ -216,43 +235,53 @@ async def _check_direct_gog_send_action():
 
     async def execute(value):
         captured.update(value)
-        return module._mail_action_result(
-            value,
-            "succeeded",
-            message_id="message-123",
-            tool_version="0.11.0",
-            exit_code=0,
-        )
+        return {
+            "status": "succeeded",
+            "provider": "gmail",
+            "tool": "gog",
+            "messageId": "message-123",
+            "error": "",
+            "toolVersion": "0.11.0",
+            "bodyMode": "body-html+body",
+            "exitCode": 0,
+        }
 
     async def reject_model_call(_event):
         raise AssertionError("Direct mail actions must bypass Hermes model execution")
 
-    module._execute_gog_mail_action = execute
+    module.execute_mail_action = execute
     adapter.handle_message = reject_model_call
     adapter._ws = WebSocket()
-    await adapter._run_job({
-        "id": "job-mail",
-        "timeoutMs": 10000,
-        "request": {
-            "sessionId": "mail-action-session",
-            "input": [],
-            "mailAction": action,
-        },
-    })
-    assert captured["htmlBody"] == html_body
-    complete = adapter._ws.messages[-1]
-    payload = json.loads(complete["response"]["output_text"])
-    receipt = payload["actionReceipt"]
-    assert receipt["status"] == "succeeded"
-    assert receipt["messageId"] == "message-123"
-    assert receipt["bodyMode"] == "body-html+body"
-    assert receipt["tool"] == "gog"
+    try:
+        await adapter._run_job({
+            "id": "job-mail",
+            "timeoutMs": 10000,
+            "request": {
+                "sessionId": "mail-action-session",
+                "input": [],
+                "mailAction": action,
+            },
+        })
+        assert captured["htmlBody"] == html_body
+        complete = adapter._ws.messages[-1]
+        payload = json.loads(complete["response"]["output_text"])
+        receipt = payload["actionReceipt"]
+        assert receipt["status"] == "succeeded"
+        assert receipt["messageId"] == "message-123"
+        assert receipt["bodyMode"] == "body-html+body"
+        assert receipt["tool"] == "gog"
 
-    args = module._build_gog_mail_args(captured)
-    assert any(value.startswith("--body-html=") for value in args)
-    assert any(value.startswith("--body=") for value in args)
-    assert "--no-input" in args
-    assert not any("body-file" in value or "/dev/stdin" in value for value in args)
+        args = mail_backends._build_gog_mail_args(captured)
+        assert any(value.startswith("--body-html=") for value in args)
+        assert any(value.startswith("--body=") for value in args)
+        assert "--no-input" in args
+        assert not any("body-file" in value or "/dev/stdin" in value for value in args)
+    finally:
+        temporary_home.cleanup()
+        if previous_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous_home
 
 
 async def _check_direct_gog_draft_action():
@@ -274,13 +303,129 @@ async def _check_direct_gog_draft_action():
     }
     normalized = module._normalize_mail_action(action)
     assert normalized["kind"] == "saveDraft"
-    args = module._build_gog_mail_args(normalized)
+    args = mail_backends._build_gog_mail_args(normalized)
     assert args[:4] == ["gog", "gmail", "drafts", "create"]
     assert "--force" not in args
     assert "--json" in args and "--no-input" in args
-    result = module._mail_action_result(normalized, "succeeded", message_id="draft-123456", tool_version="0.11.0", exit_code=0)
+    result = module._mail_action_result(normalized, "succeeded", message_id="draft-123456", provider="gmail", tool="gog", tool_version="0.11.0", exit_code=0)
     assert result["actionReceipt"]["kind"] == "saveDraft"
     assert result["actionReceipt"]["messageId"] == "draft-123456"
+
+
+async def _check_himalaya_backend_mapping():
+    recipient = "buyer@example.com"
+    action = {
+        "version": 1,
+        "actionId": "e" * 32,
+        "kind": "saveDraft",
+        "account": "sender@example.com",
+        "recipient": recipient,
+        "subject": "Himalaya draft",
+        "plainTextBody": "Plain body",
+        "htmlBody": "<p>HTML body</p>",
+        "bodyHash": "f" * 64,
+    }
+    previous_account = os.environ.get("CUSTOMER_MAP_HERMES_HIMALAYA_ACCOUNT")
+    original_version = mail_backends._read_tool_version
+    original_run = mail_backends._run_process
+    os.environ["CUSTOMER_MAP_HERMES_HIMALAYA_ACCOUNT"] = "sales"
+    try:
+        draft_args = mail_backends._build_himalaya_mail_args(action)
+        assert draft_args[:3] == ["himalaya", "message", "add"]
+        assert "--mailbox" in draft_args and "--flag" in draft_args and "draft" in draft_args
+        assert "--send" not in draft_args
+        assert draft_args[draft_args.index("--account") + 1] == "sales"
+        raw_message, message_id = mail_backends._build_rfc5322_message(action)
+        assert b"From: sender@example.com" in raw_message
+        assert b"To: buyer@example.com" in raw_message
+        assert b"Content-Type: multipart/alternative" in raw_message
+        assert action["actionId"].encode() in raw_message
+
+        async def fake_version(_tool, _minimum):
+            return "2.0.0"
+
+        async def fake_run(args, timeout, stdin=None):
+            assert args == draft_args
+            assert b"X-Customer-Map-Action-ID: " + action["actionId"].encode() in stdin
+            assert b"HTML body" in stdin and b"Plain body" in stdin
+            return {"exitCode": 0, "output": "{}", "timedOut": False, "launchError": ""}
+
+        mail_backends._read_tool_version = fake_version
+        mail_backends._run_process = fake_run
+        result = await mail_backends._execute_himalaya_mail_action(action)
+        assert result["status"] == "succeeded"
+        assert result["messageId"] == message_id
+        assert result["tool"] == "himalaya"
+        assert result["bodyMode"] == "multipart-alternative"
+    finally:
+        mail_backends._read_tool_version = original_version
+        mail_backends._run_process = original_run
+        if previous_account is None:
+            os.environ.pop("CUSTOMER_MAP_HERMES_HIMALAYA_ACCOUNT", None)
+        else:
+            os.environ["CUSTOMER_MAP_HERMES_HIMALAYA_ACCOUNT"] = previous_account
+
+
+async def _check_persistent_mail_action_idempotency():
+    module = _load_adapter()
+    with tempfile.TemporaryDirectory() as directory:
+        previous_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = directory
+        action = {
+            "version": 1,
+            "actionId": "c" * 32,
+            "kind": "sendEmail",
+            "account": "sender@example.com",
+            "recipient": "buyer@example.com",
+            "subject": "One delivery",
+            "plainTextBody": "Body",
+            "htmlBody": "",
+        }
+        action["bodyHash"] = module._mail_body_hash(action["recipient"], action["subject"], action["plainTextBody"], action["htmlBody"])
+        calls = 0
+
+        async def execute(_value):
+            nonlocal calls
+            calls += 1
+            return {"status": "succeeded", "provider": "email", "tool": "himalaya", "messageId": "message-once", "error": "", "toolVersion": "2.0.0", "bodyMode": "plain", "exitCode": 0}
+
+        module.execute_mail_action = execute
+        try:
+            first = await module.CustomerMapAdapter({})._run_direct_mail_action(action)
+            second = await module.CustomerMapAdapter({})._run_direct_mail_action(action)
+            assert first == second
+            assert calls == 1
+            assert (Path(directory) / ".customer-map-mail-actions.json").exists()
+        finally:
+            if previous_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = previous_home
+
+
+async def _check_conversational_tool_boundary_fails_closed():
+    module = _load_adapter()
+    sys.modules["hermes_cli.tools_config"]._get_platform_tools = lambda _config, _platform: {"web", "terminal"}
+    adapter = module.CustomerMapAdapter({})
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    async def reject_model_call(_event):
+        raise AssertionError("unsafe toolsets must be rejected before Hermes model execution")
+
+    adapter._ws = WebSocket()
+    adapter.handle_message = reject_model_call
+    await adapter._run_job({"id": "unsafe-tools", "timeoutMs": 10000, "request": {"sessionId": "unsafe", "input": []}})
+    complete = adapter._ws.messages[-1]
+    assert complete["type"] == "complete"
+    assert "blocked unexpected toolsets: terminal" in complete["error"]
 
 
 async def _check_rejects_stdin_body():
@@ -311,6 +456,7 @@ async def _check_rejects_stdin_body():
 
 async def _check_websocket_reconnect():
     module = _load_adapter()
+    temporary_home = tempfile.TemporaryDirectory()
     completed = asyncio.get_running_loop().create_future()
     reconnected = asyncio.get_running_loop().create_future()
     connection_count = 0
@@ -344,6 +490,7 @@ async def _check_websocket_reconnect():
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
     values = {
+        "HERMES_HOME": temporary_home.name,
         "CUSTOMER_MAP_HERMES_SITE": "http://127.0.0.1",
         "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "token",
         "CUSTOMER_MAP_HERMES_CONNECTION_ID": "connection",
@@ -374,6 +521,7 @@ async def _check_websocket_reconnect():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        temporary_home.cleanup()
 
 
 def _check_env_write():
@@ -385,9 +533,14 @@ def _check_env_write():
         os.environ["HERMES_HOME"] = directory
         try:
             module._write_env({"CUSTOMER_MAP_HERMES_SITE": "https://example.com", "CUSTOMER_MAP_HERMES_CONNECTION_ID": "abc"})
+            module.ensure_customer_map_tool_boundary()
             text = (Path(directory) / ".env").read_text(encoding="utf-8")
             assert "CUSTOMER_MAP_HERMES_SITE=https://example.com" in text
             assert "CUSTOMER_MAP_HERMES_CONNECTION_ID=abc" in text
+            config_text = (Path(directory) / "config.yaml").read_text(encoding="utf-8")
+            assert "customer_map:" in config_text
+            assert "- web" in config_text
+            assert "- no_mcp" in config_text
         finally:
             if previous is None:
                 os.environ.pop("HERMES_HOME", None)
@@ -395,13 +548,25 @@ def _check_env_write():
                 os.environ["HERMES_HOME"] = previous
 
 
+def _check_safe_platform_composite():
+    module = _load_adapter()
+    module._register_safe_platform_toolset()
+    definition = sys.modules["toolsets"].TOOLSETS["hermes-customer_map"]
+    assert definition["tools"] == ["web_search", "web_extract"]
+    assert "terminal" not in definition["tools"]
+
+
 if __name__ == "__main__":
     _check_env_write()
+    _check_safe_platform_composite()
     asyncio.run(_check_async_final_response())
     asyncio.run(_check_consecutive_session_turns())
     asyncio.run(_check_completed_turn_without_notify_flag())
     asyncio.run(_check_direct_gog_send_action())
     asyncio.run(_check_direct_gog_draft_action())
+    asyncio.run(_check_himalaya_backend_mapping())
+    asyncio.run(_check_persistent_mail_action_idempotency())
+    asyncio.run(_check_conversational_tool_boundary_fails_closed())
     asyncio.run(_check_rejects_stdin_body())
     asyncio.run(_check_websocket_reconnect())
     print("Hermes plugin checks passed")

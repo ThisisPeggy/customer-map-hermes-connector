@@ -10,7 +10,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 import uuid
 
-PLUGIN_VERSION = "0.4.0"
+try:
+    from .tool_boundary import ensure_customer_map_tool_boundary
+except ImportError:
+    from tool_boundary import ensure_customer_map_tool_boundary
+
+PLUGIN_VERSION = "0.5.0"
 
 
 def main():
@@ -42,6 +47,10 @@ def main():
         "CUSTOMER_MAP_HERMES_ALLOW_ALL_USERS": "true",
     }
     _write_env(values)
+    try:
+        ensure_customer_map_tool_boundary()
+    except Exception as exc:
+        raise SystemExit(f"Hermes was paired, but Customer Map tool isolation could not be configured: {exc}")
     print("Hermes is paired with Customer Map. Restart the Hermes gateway to connect.")
     print("  hermes gateway restart")
 

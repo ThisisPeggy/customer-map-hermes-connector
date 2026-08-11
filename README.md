@@ -2,7 +2,17 @@
 
 This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Customer Map polls queued/running relay jobs automatically and can run another foreground turn when Hermes explicitly returns `continue: true`. A timed-out task is terminal and does not continue in the background.
 
-Version 0.4.0 executes Customer Map `sendEmail` and `saveDraft` actions directly through fixed `gog` argument mappings. HTML always uses `--body-html`, plain-text fallback always uses `--body`, and the connector never uses shell redirection, heredocs, body files, or `/dev/stdin`. Ordinary Hermes chat and non-mail tasks retain the existing streaming and relay behavior.
+Version 0.5.0 separates conversational reasoning from email side effects. Ordinary Customer Map turns run on a fail-closed Hermes platform allowlist (`web`, with MCP and all local execution toolsets removed). They cannot access terminal, files, code execution, delegation, cron, or mail commands. Customer Map `sendEmail` and `saveDraft` buttons bypass the model and enter a deterministic Mail Backend adapter.
+
+`gog` remains the default backend for backward compatibility. To use Himalaya instead, configure the connector environment and restart Hermes:
+
+```bash
+CUSTOMER_MAP_HERMES_MAIL_BACKEND=himalaya
+CUSTOMER_MAP_HERMES_HIMALAYA_ACCOUNT=your-himalaya-account-name # optional; uses the default account when omitted
+CUSTOMER_MAP_HERMES_HIMALAYA_DRAFT_MAILBOX=Drafts              # optional mailbox or alias
+```
+
+The `gog` adapter uses fixed arguments and never uses a shell. The Himalaya adapter constructs an RFC 5322 message in memory and supplies it directly over the process stdin supported by Himalaya; no shell, temporary body file, or model-generated command is involved. Both adapters return the same verified receipt contract, and successful or uncertain actions are cached by `actionId` so relay retries do not repeat delivery.
 
 Tested with Hermes Agent v0.18.2. Users on older releases should update Hermes before installing the plugin.
 
@@ -16,7 +26,7 @@ During local development:
 
 ```bash
 mkdir -p ~/.hermes/plugins/customer-map-platform
-cp plugin.yaml __init__.py adapter.py connect.py ~/.hermes/plugins/customer-map-platform/
+cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py ~/.hermes/plugins/customer-map-platform/
 python3 ~/.hermes/plugins/customer-map-platform/connect.py --site https://your-customer-map.example --code CMAP-HERMES-...
 hermes gateway restart
 ```
