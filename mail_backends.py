@@ -24,17 +24,17 @@ def mail_backend_capability():
     detected = [tool for tool in ("gog", "himalaya") if shutil.which(tool)]
     if configured != "auto":
         return ("declared", configured) if configured in detected else ("unavailable", configured)
-    if len(detected) == 1:
-        return "declared", detected[0]
+    if detected:
+        return "declared", detected[0] if len(detected) == 1 else "auto"
     return "unavailable", "auto"
 
 
-async def resolve_mail_backend():
+async def resolve_mail_backends():
     configured = configured_mail_backend()
     if configured and configured != "auto":
         if configured not in ("gog", "himalaya"):
             raise RuntimeError(f"Unsupported Customer Map mail backend: {configured}.")
-        return configured
+        return [configured]
 
     available = []
     failures = []
@@ -44,13 +44,8 @@ async def resolve_mail_backend():
             available.append(backend)
         except Exception as exc:
             failures.append(f"{backend}: {_compact_status(exc, 120)}")
-    if len(available) == 1:
-        return available[0]
-    if len(available) > 1:
-        raise RuntimeError(
-            "Multiple supported mail backends were detected. Set "
-            "CUSTOMER_MAP_HERMES_MAIL_BACKEND to gog or himalaya."
-        )
+    if available:
+        return available
     raise RuntimeError(
         "No supported mail backend was detected. Install and configure a supported "
         f"backend, then restart Hermes. Detection details: {'; '.join(failures)}"
@@ -59,7 +54,7 @@ async def resolve_mail_backend():
 
 async def execute_mail_action(action):
     try:
-        backend = await resolve_mail_backend()
+        backends = await resolve_mail_backends()
     except Exception as exc:
         return _backend_result(
             "failed",
@@ -67,11 +62,18 @@ async def execute_mail_action(action):
             tool="",
             error=_compact_status(exc),
         )
-    if backend == "gog":
-        return await _execute_gog_mail_action(action)
-    if backend == "himalaya":
-        return await _execute_himalaya_mail_action(action)
-    return _backend_result("failed", provider="email", tool="", error="No supported mail backend was selected.")
+    failures = []
+    for backend in backends:
+        result = await (_execute_gog_mail_action(action) if backend == "gog" else _execute_himalaya_mail_action(action))
+        if result.get("status") != "failed":
+            return result
+        failures.append(f"{backend}: {result.get('error') or 'failed'}")
+    return _backend_result(
+        "failed",
+        provider="email",
+        tool="auto" if len(backends) > 1 else backends[0],
+        error="No configured Hermes mail adapter completed the action. " + " | ".join(failures),
+    )
 
 
 async def _execute_gog_mail_action(action):

@@ -377,17 +377,34 @@ async def _check_mail_backend_auto_detection():
 
         mail_backends._read_tool_version = only_himalaya
         assert mail_backends.configured_mail_backend() == "auto"
-        assert await mail_backends.resolve_mail_backend() == "himalaya"
+        assert await mail_backends.resolve_mail_backends() == ["himalaya"]
 
         async def both_backends(tool, _minimum):
             return "0.11.0" if tool == "gog" else "2.0.0"
 
         mail_backends._read_tool_version = both_backends
-        try:
-            await mail_backends.resolve_mail_backend()
-            raise AssertionError("multiple backends must require an explicit selection")
-        except RuntimeError as exc:
-            assert "Multiple supported mail backends" in str(exc)
+        assert await mail_backends.resolve_mail_backends() == ["gog", "himalaya"]
+
+        calls = []
+        original_gog = mail_backends._execute_gog_mail_action
+        original_himalaya = mail_backends._execute_himalaya_mail_action
+
+        async def failed_gog(_action):
+            calls.append("gog")
+            return mail_backends._backend_result("failed", provider="gmail", tool="gog", error="not configured")
+
+        async def working_himalaya(_action):
+            calls.append("himalaya")
+            return mail_backends._backend_result("succeeded", provider="email", tool="himalaya", message_id="ok")
+
+        mail_backends._execute_gog_mail_action = failed_gog
+        mail_backends._execute_himalaya_mail_action = working_himalaya
+        failover = await mail_backends.execute_mail_action({})
+        assert failover["status"] == "succeeded"
+        assert failover["tool"] == "himalaya"
+        assert calls == ["gog", "himalaya"]
+        mail_backends._execute_gog_mail_action = original_gog
+        mail_backends._execute_himalaya_mail_action = original_himalaya
 
         async def no_backends(_tool, _minimum):
             raise RuntimeError("not installed")
@@ -400,6 +417,9 @@ async def _check_mail_backend_auto_detection():
         assert "gog is unavailable" not in result["error"]
     finally:
         mail_backends._read_tool_version = original_version
+        if 'original_gog' in locals():
+            mail_backends._execute_gog_mail_action = original_gog
+            mail_backends._execute_himalaya_mail_action = original_himalaya
         if previous_backend is not None:
             os.environ["CUSTOMER_MAP_HERMES_MAIL_BACKEND"] = previous_backend
 
@@ -412,6 +432,9 @@ def _check_mail_backend_capability():
         assert mail_backends.mail_backend_capability() == ("declared", "himalaya")
         mail_backends.shutil.which = lambda _tool: None
         assert mail_backends.mail_backend_capability() == ("unavailable", "auto")
+        mail_backends.shutil.which = lambda _tool: "/bin/tool"
+        assert mail_backends.mail_backend_capability() == ("declared", "auto")
+        mail_backends.shutil.which = lambda _tool: None
         os.environ["CUSTOMER_MAP_HERMES_MAIL_BACKEND"] = "gog"
         assert mail_backends.mail_backend_capability() == ("unavailable", "gog")
     finally:

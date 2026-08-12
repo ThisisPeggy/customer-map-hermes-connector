@@ -4,7 +4,7 @@ This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map t
 
 Version 0.5.1 separates conversational reasoning from email side effects. Ordinary Customer Map turns run on a fail-closed Hermes platform allowlist (`web`, with MCP and all local execution toolsets removed). They cannot access terminal, files, code execution, delegation, cron, or mail commands. Customer Map `sendEmail` and `saveDraft` buttons bypass the model and enter a deterministic Mail Backend adapter.
 
-The default backend is `auto`: the connector detects supported local mail adapters and uses the only available one. It never asks the model or Customer Map to select a tool. If both gog and Himalaya are installed, choose one explicitly and restart Hermes:
+The default backend is `auto`: the connector executes the structured mail action through the locally available Hermes mail adapters. If an adapter is installed but not configured, it safely tries the next adapter. It never asks the model or Customer Map to select a tool. A timeout or uncertain result never falls through, which prevents duplicate delivery. An explicit override remains available for troubleshooting:
 
 ```bash
 CUSTOMER_MAP_HERMES_MAIL_BACKEND=himalaya
