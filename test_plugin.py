@@ -366,6 +366,62 @@ async def _check_himalaya_backend_mapping():
             os.environ["CUSTOMER_MAP_HERMES_HIMALAYA_ACCOUNT"] = previous_account
 
 
+async def _check_mail_backend_auto_detection():
+    original_version = mail_backends._read_tool_version
+    previous_backend = os.environ.pop("CUSTOMER_MAP_HERMES_MAIL_BACKEND", None)
+    try:
+        async def only_himalaya(tool, _minimum):
+            if tool == "himalaya":
+                return "2.0.0"
+            raise RuntimeError("not installed")
+
+        mail_backends._read_tool_version = only_himalaya
+        assert mail_backends.configured_mail_backend() == "auto"
+        assert await mail_backends.resolve_mail_backend() == "himalaya"
+
+        async def both_backends(tool, _minimum):
+            return "0.11.0" if tool == "gog" else "2.0.0"
+
+        mail_backends._read_tool_version = both_backends
+        try:
+            await mail_backends.resolve_mail_backend()
+            raise AssertionError("multiple backends must require an explicit selection")
+        except RuntimeError as exc:
+            assert "Multiple supported mail backends" in str(exc)
+
+        async def no_backends(_tool, _minimum):
+            raise RuntimeError("not installed")
+
+        mail_backends._read_tool_version = no_backends
+        result = await mail_backends.execute_mail_action({})
+        assert result["status"] == "failed"
+        assert result["tool"] == ""
+        assert "No supported mail backend" in result["error"]
+        assert "gog is unavailable" not in result["error"]
+    finally:
+        mail_backends._read_tool_version = original_version
+        if previous_backend is not None:
+            os.environ["CUSTOMER_MAP_HERMES_MAIL_BACKEND"] = previous_backend
+
+
+def _check_mail_backend_capability():
+    original_which = mail_backends.shutil.which
+    previous_backend = os.environ.pop("CUSTOMER_MAP_HERMES_MAIL_BACKEND", None)
+    try:
+        mail_backends.shutil.which = lambda tool: f"/bin/{tool}" if tool == "himalaya" else None
+        assert mail_backends.mail_backend_capability() == ("declared", "himalaya")
+        mail_backends.shutil.which = lambda _tool: None
+        assert mail_backends.mail_backend_capability() == ("unavailable", "auto")
+        os.environ["CUSTOMER_MAP_HERMES_MAIL_BACKEND"] = "gog"
+        assert mail_backends.mail_backend_capability() == ("unavailable", "gog")
+    finally:
+        mail_backends.shutil.which = original_which
+        if previous_backend is None:
+            os.environ.pop("CUSTOMER_MAP_HERMES_MAIL_BACKEND", None)
+        else:
+            os.environ["CUSTOMER_MAP_HERMES_MAIL_BACKEND"] = previous_backend
+
+
 async def _check_persistent_mail_action_idempotency():
     module = _load_adapter()
     with tempfile.TemporaryDirectory() as directory:
@@ -559,12 +615,14 @@ def _check_safe_platform_composite():
 if __name__ == "__main__":
     _check_env_write()
     _check_safe_platform_composite()
+    _check_mail_backend_capability()
     asyncio.run(_check_async_final_response())
     asyncio.run(_check_consecutive_session_turns())
     asyncio.run(_check_completed_turn_without_notify_flag())
     asyncio.run(_check_direct_gog_send_action())
     asyncio.run(_check_direct_gog_draft_action())
     asyncio.run(_check_himalaya_backend_mapping())
+    asyncio.run(_check_mail_backend_auto_detection())
     asyncio.run(_check_persistent_mail_action_idempotency())
     asyncio.run(_check_conversational_tool_boundary_fails_closed())
     asyncio.run(_check_rejects_stdin_body())

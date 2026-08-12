@@ -17,14 +17,14 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 try:
-    from .mail_backends import configured_mail_backend, execute_mail_action
+    from .mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from .tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
 except ImportError:
-    from mail_backends import configured_mail_backend, execute_mail_action
+    from mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.5.1"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 
@@ -325,16 +325,18 @@ def _enabled():
 
 
 def _capabilities():
+    mail_state, detected_backend = mail_backend_capability()
     return {
         "runtime": "verified",
         "customerMapData": "verified",
         "sessionContext": "verified",
         "webRead": "unknown",
         "webSearch": "unknown",
-        "gmailDraft": "verified",
-        "gmailSend": "verified",
-        "mailAction": "verified",
-        "mailBackend": configured_mail_backend(),
+        "gmailDraft": mail_state,
+        "gmailSend": mail_state,
+        "mailAction": mail_state,
+        "mailBackend": detected_backend,
+        "mailBackendMode": configured_mail_backend(),
         "conversationalToolBoundary": "web-only",
         "memory": "unknown",
     }
