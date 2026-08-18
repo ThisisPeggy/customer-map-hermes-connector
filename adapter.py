@@ -19,12 +19,14 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 try:
     from .mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from .tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
+    from .email_verifier import email_verifier_capability, verify_emails
 except ImportError:
     from mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
+    from email_verifier import email_verifier_capability, verify_emails
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.2"
+PLUGIN_VERSION = "0.5.3"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 
@@ -173,6 +175,16 @@ class CustomerMapAdapter(BasePlatformAdapter):
         completion = asyncio.get_running_loop().create_future()
         self._pending[session_id] = {"job_id": job_id, "completion": completion, "last_content": "", "last_metadata": {}}
         try:
+            if request.get("emailVerification") is not None:
+                value = request.get("emailVerification")
+                if not isinstance(value, dict) or value.get("version") != 1:
+                    raise ValueError("Unsupported Customer Map email verification request.")
+                output_text = json.dumps({"results": await verify_emails(value.get("emails"))}, ensure_ascii=False, separators=(",", ":"))
+                if not await self._complete(job_id, response={"output_text": output_text}):
+                    raise ConnectionError("Customer Map relay is disconnected")
+                if not completion.done():
+                    completion.set_result(output_text)
+                return
             if request.get("mailAction") is not None:
                 response = await self._run_direct_mail_action(request.get("mailAction"))
                 output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
@@ -338,6 +350,7 @@ def _capabilities():
         "mailBackend": detected_backend,
         "mailBackendMode": configured_mail_backend(),
         "conversationalToolBoundary": "web-only",
+        "emailVerification": email_verifier_capability(),
         "memory": "unknown",
     }
 

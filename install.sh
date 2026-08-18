@@ -5,10 +5,10 @@ base="https://raw.githubusercontent.com/ThisisPeggy/customer-map-hermes-connecto
 target="${HERMES_HOME:-$HOME/.hermes}/plugins/customer-map-platform"
 mkdir -p "$target"
 chmod 700 "$target"
-for file in plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py test_plugin.py; do
+for file in plugin.yaml __init__.py adapter.py connect.py mail_backends.py email_verifier.py tool_boundary.py test_plugin.py; do
   curl -fsSL "$base/$file" -o "$target/$file"
 done
-chmod 600 "$target/plugin.yaml" "$target/__init__.py" "$target/adapter.py" "$target/mail_backends.py" "$target/tool_boundary.py"
+chmod 600 "$target/plugin.yaml" "$target/__init__.py" "$target/adapter.py" "$target/mail_backends.py" "$target/email_verifier.py" "$target/tool_boundary.py"
 chmod 700 "$target/connect.py" "$target/test_plugin.py"
 hermes plugins enable customer-map-platform --no-allow-tool-override
 echo "Customer Map plugin installed at $target"
