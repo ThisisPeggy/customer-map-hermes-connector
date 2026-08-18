@@ -37,11 +37,3 @@ optional_env:
     description: Optional Himalaya config file path
     prompt: Himalaya config path
     secret: false
-  - name: CUSTOMER_MAP_HERMES_EMAIL_VERIFIER_URL
-    description: Self-hosted Reacher or compatible HTTP endpoint for deterministic email verification
-    prompt: Email verifier URL
-    secret: false
-  - name: CUSTOMER_MAP_HERMES_EMAIL_VERIFIER_SECRET
-    description: Optional bearer token for the self-hosted email verifier
-    prompt: Email verifier secret
-    secret: true

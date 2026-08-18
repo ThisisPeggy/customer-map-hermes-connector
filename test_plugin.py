@@ -16,7 +16,6 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 import mail_backends
-import email_verifier
 
 
 def _load_adapter():
@@ -634,25 +633,12 @@ def _check_safe_platform_composite():
     definition = sys.modules["toolsets"].TOOLSETS["hermes-customer_map"]
     assert definition["tools"] == ["web_search", "web_extract"]
     assert "terminal" not in definition["tools"]
-
-
-def _check_email_verifier_fallback():
-    previous = os.environ.pop("CUSTOMER_MAP_HERMES_EMAIL_VERIFIER_URL", None)
-    try:
-        results = asyncio.run(email_verifier.verify_emails(["valid@example.com", "invalid-address"]))
-        assert results[0]["status"] == "unknown"
-        assert results[0]["checks"]["syntax"] is True
-        assert results[1]["status"] == "undeliverable"
-        assert results[1]["checks"]["syntax"] is False
-    finally:
-        if previous is not None:
-            os.environ["CUSTOMER_MAP_HERMES_EMAIL_VERIFIER_URL"] = previous
+    assert "emailVerification" not in module._capabilities()
 
 
 if __name__ == "__main__":
     _check_env_write()
     _check_safe_platform_composite()
-    _check_email_verifier_fallback()
     _check_mail_backend_capability()
     asyncio.run(_check_async_final_response())
     asyncio.run(_check_consecutive_session_turns())

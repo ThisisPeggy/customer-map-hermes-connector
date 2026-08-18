@@ -2,7 +2,7 @@
 
 This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Customer Map polls queued/running relay jobs automatically and can run another foreground turn when Hermes explicitly returns `continue: true`. A timed-out task is terminal and does not continue in the background.
 
-Version 0.5.3 separates conversational reasoning from deterministic side effects. Ordinary Customer Map turns run on a fail-closed Hermes platform allowlist (`web`, with MCP and all local execution toolsets removed). They cannot access terminal, files, code execution, delegation, cron, or mail commands. Customer Map mail actions and email-verification jobs bypass the model and enter dedicated adapters.
+Version 0.5.3 separates conversational reasoning from deterministic mail side effects. Ordinary Customer Map turns run on a fail-closed Hermes platform allowlist (`web`, with MCP and all local execution toolsets removed). They cannot access terminal, files, code execution, delegation, cron, or mail commands. Customer Map mail actions bypass the model and enter dedicated adapters.
 
 The default backend is `auto`: the connector executes the structured mail action through the locally available Hermes mail adapters. If an adapter is installed but not configured, it safely tries the next adapter. It never asks the model or Customer Map to select a tool. A timeout or uncertain result never falls through, which prevents duplicate delivery. An explicit override remains available for troubleshooting:
 
@@ -13,15 +13,6 @@ CUSTOMER_MAP_HERMES_HIMALAYA_DRAFT_MAILBOX=Drafts              # optional mailbo
 ```
 
 If no supported adapter is available, the connector returns a backend-neutral configuration error instead of assuming gog. Additional user mail tools require a deterministic Connector adapter that implements the same receipt contract.
-
-Email verification is also deterministic and bypasses the model. Point the connector at a user-owned Reacher or compatible service:
-
-```bash
-CUSTOMER_MAP_HERMES_EMAIL_VERIFIER_URL=http://127.0.0.1:8080/v0/check_email
-CUSTOMER_MAP_HERMES_EMAIL_VERIFIER_SECRET=optional-bearer-token
-```
-
-Without this setting the connector checks syntax and reports mailbox status as `unknown`; it never guesses that an address is deliverable.
 
 The `gog` adapter uses fixed arguments and never uses a shell. The Himalaya adapter constructs an RFC 5322 message in memory and supplies it directly over the process stdin supported by Himalaya; no shell, temporary body file, or model-generated command is involved. Both adapters return the same verified receipt contract, and successful or uncertain actions are cached by `actionId` so relay retries do not repeat delivery.
 
@@ -37,7 +28,7 @@ During local development:
 
 ```bash
 mkdir -p ~/.hermes/plugins/customer-map-platform
-cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py email_verifier.py tool_boundary.py ~/.hermes/plugins/customer-map-platform/
+cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py ~/.hermes/plugins/customer-map-platform/
 python3 ~/.hermes/plugins/customer-map-platform/connect.py --site https://your-customer-map.example --code CMAP-HERMES-...
 hermes gateway restart
 ```
