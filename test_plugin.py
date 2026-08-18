@@ -134,6 +134,40 @@ async def _check_async_final_response():
     }]
 
 
+def _check_safe_tool_activity():
+    module = _load_adapter()
+    assert module._tool_activity("web_search", {"query": "Raute OYJ contact"}) == "正在搜索：Raute OYJ contact"
+    assert module._tool_activity("web_extract", {"urls": ["https://www.raute.com/contact/?token=secret"]}) == "正在读取：raute.com"
+    assert module._tool_activity("terminal", {"command": "printenv SECRET"}) == ""
+
+
+async def _check_tool_activity_progress():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+
+    class WebSocket:
+        closed = False
+        def __init__(self):
+            self.messages = []
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    adapter._ws = WebSocket()
+    adapter._loop = asyncio.get_running_loop()
+    adapter._pending["customer-map-session"] = {"job_id": "job-tool", "hermes_session_id": "", "completion": None, "last_content": "", "last_metadata": {}}
+    with module._ACTIVE_ADAPTERS_LOCK:
+        module._ACTIVE_ADAPTERS.add(adapter)
+    try:
+        module._on_session_start(platform="customer_map", session_id="hermes-session")
+        module._on_pre_tool_call(session_id="hermes-session", tool_name="web_search", args={"query": "Raute OYJ"})
+        await asyncio.sleep(0.01)
+        assert adapter._ws.messages[-1]["content"] == "正在搜索：Raute OYJ"
+        assert adapter._pending["customer-map-session"]["hermes_session_id"] == "hermes-session"
+    finally:
+        with module._ACTIVE_ADAPTERS_LOCK:
+            module._ACTIVE_ADAPTERS.discard(adapter)
+
+
 async def _check_consecutive_session_turns():
     module = _load_adapter()
     adapter = module.CustomerMapAdapter({})
@@ -639,6 +673,8 @@ def _check_safe_platform_composite():
 if __name__ == "__main__":
     _check_env_write()
     _check_safe_platform_composite()
+    _check_safe_tool_activity()
+    asyncio.run(_check_tool_activity_progress())
     _check_mail_backend_capability()
     asyncio.run(_check_async_final_response())
     asyncio.run(_check_consecutive_session_turns())

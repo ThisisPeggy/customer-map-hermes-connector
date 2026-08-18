@@ -2,7 +2,7 @@
 
 This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Customer Map polls queued/running relay jobs automatically and can run another foreground turn when Hermes explicitly returns `continue: true`. A timed-out task is terminal and does not continue in the background.
 
-Version 0.5.3 separates conversational reasoning from deterministic mail side effects. Ordinary Customer Map turns run on a fail-closed Hermes platform allowlist (`web`, with MCP and all local execution toolsets removed). They cannot access terminal, files, code execution, delegation, cron, or mail commands. Customer Map mail actions bypass the model and enter dedicated adapters.
+Version 0.5.4 separates conversational reasoning from deterministic mail side effects and reports safe web-search/page-read activity to Customer Map. Ordinary Customer Map turns run on a fail-closed Hermes platform allowlist (`web`, with MCP and all local execution toolsets removed). They cannot access terminal, files, code execution, delegation, cron, or mail commands. Customer Map mail actions bypass the model and enter dedicated adapters.
 
 The default backend is `auto`: the connector executes the structured mail action through the locally available Hermes mail adapters. If an adapter is installed but not configured, it safely tries the next adapter. It never asks the model or Customer Map to select a tool. A timeout or uncertain result never falls through, which prevents duplicate delivery. An explicit override remains available for troubleshooting:
 

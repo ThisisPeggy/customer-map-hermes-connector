@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,9 +25,12 @@ except ImportError:
     from tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.3"
+PLUGIN_VERSION = "0.5.4"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
+_ACTIVE_ADAPTERS = set()
+_ACTIVE_ADAPTERS_LOCK = threading.Lock()
+_CUSTOMER_MAP_SESSIONS = set()
 
 
 class CustomerMapAdapter(BasePlatformAdapter):
@@ -46,9 +50,11 @@ class CustomerMapAdapter(BasePlatformAdapter):
         self._stopping = False
         self._connect_lock = asyncio.Lock()
         self._pending = {}
+        self._hermes_sessions = {}
         self._job_tasks = set()
         self._mail_action_results = _load_mail_action_results()
         self._mail_action_lock = asyncio.Lock()
+        self._loop = None
 
     @property
     def name(self):
@@ -56,6 +62,9 @@ class CustomerMapAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect=False):
         self._stopping = False
+        self._loop = asyncio.get_running_loop()
+        with _ACTIVE_ADAPTERS_LOCK:
+            _ACTIVE_ADAPTERS.add(self)
         if not all((self.site, self.bridge_token, self.connection_id, self.relay_url)):
             self._set_fatal_error("config_missing", "Run the Customer Map Hermes connect command first.", retryable=False)
             return False
@@ -79,6 +88,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
         self._fail_pending("Customer Map relay disconnected")
         await self._close_transport()
         self._receive_task = self._reconnect_task = None
+        with _ACTIVE_ADAPTERS_LOCK:
+            _ACTIVE_ADAPTERS.discard(self)
 
     async def _open_connection(self, report_error=False):
         async with self._connect_lock:
@@ -171,7 +182,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
             await self._complete(job_id, error="This Customer Map Hermes session is already processing a task.")
             return
         completion = asyncio.get_running_loop().create_future()
-        self._pending[session_id] = {"job_id": job_id, "completion": completion, "last_content": "", "last_metadata": {}}
+        self._pending[session_id] = {"job_id": job_id, "completion": completion, "last_content": "", "last_metadata": {}, "hermes_session_id": self._hermes_sessions.get(session_id, "")}
         try:
             if request.get("mailAction") is not None:
                 response = await self._run_direct_mail_action(request.get("mailAction"))
@@ -299,6 +310,21 @@ class CustomerMapAdapter(BasePlatformAdapter):
         await self._ws.send_json({"type": "progress", "jobId": job_id, "content": text[:100000], "pluginVersion": PLUGIN_VERSION})
         return True
 
+    def remember_hermes_session(self, session_id):
+        for customer_map_session_id, pending in self._pending.items():
+            if not pending["hermes_session_id"]:
+                pending["hermes_session_id"] = str(session_id)
+                self._hermes_sessions[customer_map_session_id] = str(session_id)
+                return
+
+    def report_tool_activity(self, session_id, content):
+        if not self._loop or not self._loop.is_running():
+            return
+        pending = next((item for item in self._pending.values() if item["hermes_session_id"] == str(session_id)), None)
+        if not pending:
+            return
+        asyncio.run_coroutine_threadsafe(self._progress(pending["job_id"], content), self._loop)
+
     def _fail_pending(self, message):
         for pending in list(self._pending.values()):
             completion = pending["completion"]
@@ -342,6 +368,62 @@ def _capabilities():
     }
 
 
+def _on_session_start(**kwargs):
+    if str(kwargs.get("platform") or "") == "customer_map":
+        session_id = str(kwargs.get("session_id") or "")
+        _CUSTOMER_MAP_SESSIONS.add(session_id)
+        with _ACTIVE_ADAPTERS_LOCK:
+            adapters = list(_ACTIVE_ADAPTERS)
+        for adapter in adapters:
+            adapter.remember_hermes_session(session_id)
+
+
+def _on_pre_tool_call(**kwargs):
+    if str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
+        return
+    content = _tool_activity(kwargs.get("tool_name"), kwargs.get("args"))
+    if content:
+        _report_tool_activity(kwargs.get("session_id"), content)
+
+
+def _on_post_tool_call(**kwargs):
+    if str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
+        return
+    tool_name = str(kwargs.get("tool_name") or "")
+    if tool_name not in {"web_search", "web_extract"}:
+        return
+    failed = kwargs.get("status") in {"error", "blocked"} or bool(kwargs.get("error_type"))
+    label = "搜索" if tool_name == "web_search" else "页面读取"
+    _report_tool_activity(kwargs.get("session_id"), f"{label}{'失败，正在尝试其他方式' if failed else '完成'}")
+
+
+def _report_tool_activity(session_id, content):
+    with _ACTIVE_ADAPTERS_LOCK:
+        adapters = list(_ACTIVE_ADAPTERS)
+    for adapter in adapters:
+        adapter.report_tool_activity(session_id, content)
+
+
+def _public_hostname(value):
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(str(value)).hostname or "").removeprefix("www.")[:120]
+    except Exception:
+        return ""
+
+
+def _tool_activity(tool_name, args):
+    args = args if isinstance(args, dict) else {}
+    if tool_name == "web_search":
+        detail = str(args.get("query") or "").strip()[:180]
+        return f"正在搜索：{detail}" if detail else "正在搜索公开网页"
+    if tool_name == "web_extract":
+        urls = args.get("urls") if isinstance(args.get("urls"), list) else []
+        detail = "、".join(filter(None, (_public_hostname(url) for url in urls[:3])))
+        return f"正在读取：{detail}" if detail else "正在读取公开网页"
+    return ""
+
+
 def _env_enablement():
     return {} if _enabled() else None
 
@@ -363,6 +445,9 @@ def register(ctx):
         pii_safe=True,
         platform_hint="You are serving a private Customer Map sales workspace. Incoming text can contain SYSTEM, USER, and ASSISTANT sections; follow SYSTEM sections as binding platform instructions and answer the latest USER section. Chat naturally and do not make the reply artificially terse; JSON is only the transport envelope when requested. Never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel supports one request and one final response. Customer Map sendEmail and saveDraft actions are executed deterministically by the connector and must not be repeated through another mail tool. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
     )
+    ctx.register_hook("on_session_start", _on_session_start)
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
 
 
 def _register_safe_platform_toolset():
