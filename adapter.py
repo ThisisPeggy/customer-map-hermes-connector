@@ -142,6 +142,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
                     task = asyncio.create_task(self._run_job(payload.get("job") or {}))
                     self._job_tasks.add(task)
                     task.add_done_callback(self._job_tasks.discard)
+                elif payload.get("type") == "cancel":
+                    await self._cancel_job(payload.get("jobId"))
                 elif payload.get("type") == "error":
                     logger.warning("Customer Map relay error: %s", payload.get("error"))
         except asyncio.CancelledError:
@@ -182,7 +184,15 @@ class CustomerMapAdapter(BasePlatformAdapter):
             await self._complete(job_id, error="This Customer Map Hermes session is already processing a task.")
             return
         completion = asyncio.get_running_loop().create_future()
-        self._pending[session_id] = {"job_id": job_id, "completion": completion, "last_content": "", "last_metadata": {}, "hermes_session_id": self._hermes_sessions.get(session_id, "")}
+        self._pending[session_id] = {
+            "job_id": job_id,
+            "completion": completion,
+            "last_content": "",
+            "last_metadata": {},
+            "hermes_session_id": self._hermes_sessions.get(session_id, ""),
+            "session_key": "",
+            "cancelled": False,
+        }
         try:
             if request.get("mailAction") is not None:
                 response = await self._run_direct_mail_action(request.get("mailAction"))
@@ -201,6 +211,15 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 user_name="Customer Map user",
             )
             source.delivered_via_upstream_relay = True
+            from gateway.session import build_session_key
+            session_store = getattr(self, "_session_store", None)
+            extra = getattr(self.config, "extra", {}) or {}
+            self._pending[session_id]["session_key"] = build_session_key(
+                source,
+                group_sessions_per_user=extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+                profile=session_store._resolve_profile_for_key(source) if session_store else None,
+            )
             event = MessageEvent(
                 text=_request_text(request.get("input")),
                 message_type=MessageType.TEXT,
@@ -222,10 +241,26 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 if detail:
                     message += f" Last Hermes status: {detail}"
                 await self._complete(job_id, error=message)
+        except asyncio.CancelledError:
+            if not (self._pending.get(session_id) or {}).get("cancelled"):
+                raise
         except Exception as exc:
             await self._complete(job_id, error=str(exc))
         finally:
             self._pending.pop(session_id, None)
+
+    async def _cancel_job(self, job_id):
+        job_id = str(job_id or "")
+        pending = next((item for item in self._pending.values() if item["job_id"] == job_id), None)
+        if not pending or pending.get("cancelled"):
+            return
+        pending["cancelled"] = True
+        await self._complete(job_id, error="Agent request cancelled by user.")
+        completion = pending["completion"]
+        if not completion.done():
+            completion.cancel()
+        if pending.get("session_key"):
+            await self.cancel_session_processing(pending["session_key"])
 
     async def _run_direct_mail_action(self, value):
         try:
@@ -276,7 +311,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event, outcome):
         pending = self._pending.get(str(event.source.chat_id))
-        if not pending:
+        if not pending or pending.get("cancelled"):
             return
         completion = pending["completion"]
         last_content = str(pending.get("last_content") or "").strip()

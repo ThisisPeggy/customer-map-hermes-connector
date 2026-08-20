@@ -24,6 +24,7 @@ def _load_adapter():
     platforms = types.ModuleType("gateway.platforms")
     base = types.ModuleType("gateway.platforms.base")
     gateway_run = types.ModuleType("gateway.run")
+    gateway_session = types.ModuleType("gateway.session")
     hermes_cli = types.ModuleType("hermes_cli")
     tools_config = types.ModuleType("hermes_cli.tools_config")
     toolsets = types.ModuleType("toolsets")
@@ -74,12 +75,14 @@ def _load_adapter():
     gateway_run._load_gateway_config = lambda: {"platform_toolsets": {"customer_map": ["web", "no_mcp"]}}
     tools_config._get_platform_tools = lambda _config, _platform: {"web"}
     tools_config._get_plugin_toolset_keys = lambda: set()
+    gateway_session.build_session_key = lambda source, **_kwargs: f"agent:main:customer_map:dm:{source.chat_id}"
     sys.modules.update({
         "gateway": gateway,
         "gateway.config": config,
         "gateway.platforms": platforms,
         "gateway.platforms.base": base,
         "gateway.run": gateway_run,
+        "gateway.session": gateway_session,
         "hermes_cli": hermes_cli,
         "hermes_cli.tools_config": tools_config,
         "toolsets": toolsets,
@@ -195,6 +198,43 @@ async def _check_consecutive_session_turns():
     completed = [message for message in adapter._ws.messages if message.get("type") == "complete"]
     assert [message.get("jobId") for message in completed] == ["job-a", "job-b"]
     assert all(not message.get("error") for message in completed)
+
+
+async def _check_active_job_cancellation():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+    adapter.config = SimpleNamespace(extra={})
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    adapter._ws = WebSocket()
+    cancelled = []
+
+    async def handle_message(_event):
+        return None
+
+    async def cancel_session_processing(session_key):
+        cancelled.append(session_key)
+
+    adapter.handle_message = handle_message
+    adapter.cancel_session_processing = cancel_session_processing
+    task = asyncio.create_task(adapter._run_job({"id": "job-cancel", "timeoutMs": 10000, "request": {"sessionId": "session-cancel", "input": []}}))
+    while "session-cancel" not in adapter._pending or not adapter._pending["session-cancel"].get("session_key"):
+        await asyncio.sleep(0)
+    await adapter._cancel_job("job-cancel")
+    await task
+
+    assert cancelled == ["agent:main:customer_map:dm:session-cancel"]
+    assert adapter._ws.messages[-1]["type"] == "complete"
+    assert adapter._ws.messages[-1]["jobId"] == "job-cancel"
+    assert adapter._ws.messages[-1]["error"] == "Agent request cancelled by user."
 
 
 async def _check_completed_turn_without_notify_flag():
@@ -678,6 +718,7 @@ if __name__ == "__main__":
     _check_mail_backend_capability()
     asyncio.run(_check_async_final_response())
     asyncio.run(_check_consecutive_session_turns())
+    asyncio.run(_check_active_job_cancellation())
     asyncio.run(_check_completed_turn_without_notify_flag())
     asyncio.run(_check_direct_gog_send_action())
     asyncio.run(_check_direct_gog_draft_action())
