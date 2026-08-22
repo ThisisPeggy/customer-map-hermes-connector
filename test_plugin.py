@@ -137,6 +137,35 @@ async def _check_async_final_response():
     }]
 
 
+async def _check_streaming_response_frames():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+
+    class WebSocket:
+        closed = False
+
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, value):
+            self.messages.append(value)
+
+    adapter._ws = WebSocket()
+    adapter._pending["session-stream"] = {
+        "job_id": "job-stream",
+        "completion": asyncio.get_running_loop().create_future(),
+        "last_content": "",
+        "last_metadata": {},
+    }
+
+    assert adapter.supports_draft_streaming(chat_type="dm") is True
+    draft = await adapter.send_draft("session-stream", 1, "第一段")
+    edited = await adapter.edit_message("session-stream", "job-stream", "第一段第二段")
+    assert draft.success and edited.success
+    assert [message["content"] for message in adapter._ws.messages] == ["第一段", "第一段第二段"]
+    assert adapter._pending["session-stream"]["last_content"] == "第一段第二段"
+
+
 def _check_safe_tool_activity():
     module = _load_adapter()
     assert module._tool_activity("web_search", {"query": "Raute OYJ contact"}) == "正在搜索：Raute OYJ contact"
@@ -717,6 +746,7 @@ if __name__ == "__main__":
     asyncio.run(_check_tool_activity_progress())
     _check_mail_backend_capability()
     asyncio.run(_check_async_final_response())
+    asyncio.run(_check_streaming_response_frames())
     asyncio.run(_check_consecutive_session_turns())
     asyncio.run(_check_active_job_cancellation())
     asyncio.run(_check_completed_turn_without_notify_flag())

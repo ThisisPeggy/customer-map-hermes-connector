@@ -25,7 +25,7 @@ except ImportError:
     from tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.5"
+PLUGIN_VERSION = "0.5.6"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 _ACTIVE_ADAPTERS = set()
@@ -308,6 +308,15 @@ class CustomerMapAdapter(BasePlatformAdapter):
         if not completion.done():
             completion.set_result(str(content))
         return SendResult(success=True, message_id=job_id)
+
+    def supports_draft_streaming(self, chat_type=None, metadata=None, chat_id=None):
+        return True
+
+    async def send_draft(self, chat_id, draft_id, content, metadata=None):
+        return await self.send(chat_id, content, metadata={})
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False, metadata=None):
+        return await self.send(chat_id, content, metadata={})
 
     async def on_processing_complete(self, event, outcome):
         pending = self._pending.get(str(event.source.chat_id))
