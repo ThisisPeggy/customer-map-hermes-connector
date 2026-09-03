@@ -784,6 +784,8 @@ def _check_safe_platform_composite():
     ]
     assert "terminal" not in definition["tools"]
     assert "skill_manage" not in definition["tools"]
+    assert sys.modules["toolsets"].TOOLSETS["hermes-customer_map"] == definition
+    assert "kanban_show" not in definition["tools"]
     assert "emailVerification" not in module._capabilities()
 
 

@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 SAFE_TOOLSET_NAME = "customer-map-readonly"
+PLATFORM_DEFAULT_TOOLSET_NAME = "hermes-customer_map"
 SAFE_PLATFORM_TOOLSETS = [SAFE_TOOLSET_NAME, "no_mcp"]
 # Hermes reverse-maps the complete built-in web subset from this composite.
 ALLOWED_EFFECTIVE_TOOLSETS = {SAFE_TOOLSET_NAME, "web"}
@@ -31,11 +32,16 @@ def firecrawl_operation(tool_name):
 def register_customer_map_toolset():
     from toolsets import TOOLSETS
 
-    TOOLSETS[SAFE_TOOLSET_NAME] = {
+    definition = {
         "description": "Customer Map read-only web research and installed skill loading",
         "tools": sorted(allowed_effective_tools()),
         "includes": [],
     }
+    # Unknown plugin platforms otherwise resolve their hermes-<platform>
+    # default to the full core tool universe before explicit settings are
+    # applied, which lets non-configurable sets such as kanban be recovered.
+    TOOLSETS[PLATFORM_DEFAULT_TOOLSET_NAME] = definition
+    TOOLSETS[SAFE_TOOLSET_NAME] = definition
 
 
 def _registered_firecrawl_read_tools():

@@ -26,7 +26,7 @@ except ImportError:
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.7"
+PLUGIN_VERSION = "0.5.8"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 _ACTIVE_ADAPTERS = set()
