@@ -183,7 +183,7 @@ def _check_safe_tool_activity():
     assert module._tool_activity("mcp__my_firecrawl__firecrawl_scrape", {"url": "https://www.raute.com/contact/?token=secret"}) == "正在深度读取：raute.com"
     assert module._tool_activity("mcp__other__firecrawl_search", {"query": "blocked"}) == ""
     assert module._tool_activity("skill_view", {"name": "customer-research"}) == "正在加载技能：customer-research"
-    assert module._tool_activity("terminal", {"command": "printenv SECRET"}) == ""
+    assert module._tool_activity("terminal", {"command": "blocked"}) == ""
 
 
 def _check_tool_call_boundary():
