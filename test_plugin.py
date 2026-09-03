@@ -27,9 +27,16 @@ def _load_adapter():
     gateway_session = types.ModuleType("gateway.session")
     hermes_cli = types.ModuleType("hermes_cli")
     tools_config = types.ModuleType("hermes_cli.tools_config")
+    tools = types.ModuleType("tools")
+    tools_registry = types.ModuleType("tools.registry")
     toolsets = types.ModuleType("toolsets")
     toolsets.TOOLSETS = {}
-    toolsets.resolve_toolset = lambda name: ["web_search", "web_extract"] if name == "web" else []
+    toolsets.resolve_toolset = lambda name: list(toolsets.TOOLSETS.get(name, {}).get("tools", []))
+    tools_registry.registry = SimpleNamespace(get_all_entries=lambda: [
+        SimpleNamespace(name="mcp__my_firecrawl__firecrawl_scrape", toolset="mcp-my-firecrawl"),
+        SimpleNamespace(name="mcp__my_firecrawl__firecrawl_search", toolset="mcp-my-firecrawl"),
+        SimpleNamespace(name="mcp__other__firecrawl_search", toolset="mcp-other"),
+    ])
 
     class Platform(str):
         @property
@@ -72,8 +79,8 @@ def _load_adapter():
     base.MessageEvent = MessageEvent
     base.MessageType = MessageType
     base.SendResult = SendResult
-    gateway_run._load_gateway_config = lambda: {"platform_toolsets": {"customer_map": ["web", "no_mcp"]}}
-    tools_config._get_platform_tools = lambda _config, _platform: {"web"}
+    gateway_run._load_gateway_config = lambda: {"platform_toolsets": {"customer_map": ["customer-map-readonly", "no_mcp"]}}
+    tools_config._get_platform_tools = lambda _config, _platform: {"customer-map-readonly"}
     tools_config._get_plugin_toolset_keys = lambda: set()
     gateway_session.build_session_key = lambda source, **_kwargs: f"agent:main:customer_map:dm:{source.chat_id}"
     sys.modules.update({
@@ -85,6 +92,8 @@ def _load_adapter():
         "gateway.session": gateway_session,
         "hermes_cli": hermes_cli,
         "hermes_cli.tools_config": tools_config,
+        "tools": tools,
+        "tools.registry": tools_registry,
         "toolsets": toolsets,
     })
     spec = importlib.util.spec_from_file_location("customer_map_adapter_test", ROOT / "adapter.py")
@@ -170,7 +179,42 @@ def _check_safe_tool_activity():
     module = _load_adapter()
     assert module._tool_activity("web_search", {"query": "Raute OYJ contact"}) == "正在搜索：Raute OYJ contact"
     assert module._tool_activity("web_extract", {"urls": ["https://www.raute.com/contact/?token=secret"]}) == "正在读取：raute.com"
+    assert module._tool_activity("mcp__my_firecrawl__firecrawl_search", {"query": "Raute OYJ contact"}) == "正在深度搜索：Raute OYJ contact"
+    assert module._tool_activity("mcp__my_firecrawl__firecrawl_scrape", {"url": "https://www.raute.com/contact/?token=secret"}) == "正在深度读取：raute.com"
+    assert module._tool_activity("mcp__other__firecrawl_search", {"query": "blocked"}) == ""
+    assert module._tool_activity("skill_view", {"name": "customer-research"}) == "正在加载技能：customer-research"
     assert module._tool_activity("terminal", {"command": "printenv SECRET"}) == ""
+
+
+def _check_tool_call_boundary():
+    module = _load_adapter()
+    module._CUSTOMER_MAP_SESSIONS.add("customer-map-session")
+    assert module._on_pre_tool_call(
+        session_id="customer-map-session", tool_name="skills_list", args={}
+    ) is None
+    assert module._on_pre_tool_call(
+        session_id="customer-map-session",
+        tool_name="mcp__my_firecrawl__firecrawl_scrape",
+        args={"url": "https://example.com/about"},
+    ) is None
+    blocked_action = module._on_pre_tool_call(
+        session_id="customer-map-session",
+        tool_name="mcp__my_firecrawl__firecrawl_scrape",
+        args={"url": "https://example.com", "actions": [{"type": "click", "selector": "button"}]},
+    )
+    assert blocked_action["action"] == "block"
+    assert "interactive browser actions" in blocked_action["message"]
+    blocked_url = module._on_pre_tool_call(
+        session_id="customer-map-session",
+        tool_name="mcp__my_firecrawl__firecrawl_scrape",
+        args={"url": "http://127.0.0.1/private"},
+    )
+    assert blocked_url["action"] == "block"
+    assert "public HTTP(S)" in blocked_url["message"]
+    blocked_tool = module._on_pre_tool_call(
+        session_id="customer-map-session", tool_name="skill_manage", args={}
+    )
+    assert blocked_tool["action"] == "block"
 
 
 async def _check_tool_activity_progress():
@@ -721,7 +765,7 @@ def _check_env_write():
             assert "CUSTOMER_MAP_HERMES_CONNECTION_ID=abc" in text
             config_text = (Path(directory) / "config.yaml").read_text(encoding="utf-8")
             assert "customer_map:" in config_text
-            assert "- web" in config_text
+            assert "- customer-map-readonly" in config_text
             assert "- no_mcp" in config_text
         finally:
             if previous is None:
@@ -733,9 +777,13 @@ def _check_env_write():
 def _check_safe_platform_composite():
     module = _load_adapter()
     module._register_safe_platform_toolset()
-    definition = sys.modules["toolsets"].TOOLSETS["hermes-customer_map"]
-    assert definition["tools"] == ["web_search", "web_extract"]
+    definition = sys.modules["toolsets"].TOOLSETS["customer-map-readonly"]
+    assert definition["tools"] == [
+        "mcp__my_firecrawl__firecrawl_scrape", "mcp__my_firecrawl__firecrawl_search",
+        "skill_view", "skills_list", "web_extract", "web_search",
+    ]
     assert "terminal" not in definition["tools"]
+    assert "skill_manage" not in definition["tools"]
     assert "emailVerification" not in module._capabilities()
 
 
@@ -743,6 +791,7 @@ if __name__ == "__main__":
     _check_env_write()
     _check_safe_platform_composite()
     _check_safe_tool_activity()
+    _check_tool_call_boundary()
     asyncio.run(_check_tool_activity_progress())
     _check_mail_backend_capability()
     asyncio.run(_check_async_final_response())

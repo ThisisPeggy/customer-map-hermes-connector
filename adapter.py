@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -19,13 +20,13 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 
 try:
     from .mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
-    from .tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
+    from .tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 except ImportError:
     from mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
-    from tool_boundary import assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary
+    from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.6"
+PLUGIN_VERSION = "0.5.7"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 _ACTIVE_ADAPTERS = set()
@@ -70,7 +71,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
             return False
         try:
             if ensure_customer_map_tool_boundary():
-                logger.info("Customer Map Hermes web-only tool boundary was updated")
+                logger.info("Customer Map Hermes read-only tool boundary was updated")
         except Exception as exc:
             self._set_fatal_error("tool_boundary_failed", str(exc), retryable=False)
             return False
@@ -407,7 +408,7 @@ def _capabilities():
         "mailAction": mail_state,
         "mailBackend": detected_backend,
         "mailBackendMode": configured_mail_backend(),
-        "conversationalToolBoundary": "web-only",
+        "conversationalToolBoundary": "research-read-only",
         "memory": "unknown",
     }
 
@@ -425,7 +426,16 @@ def _on_session_start(**kwargs):
 def _on_pre_tool_call(**kwargs):
     if str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
         return
-    content = _tool_activity(kwargs.get("tool_name"), kwargs.get("args"))
+    tool_name = str(kwargs.get("tool_name") or "")
+    args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+    if tool_name not in allowed_effective_tools():
+        return {"action": "block", "message": f"Customer Map blocked unavailable tool: {tool_name}"}
+    if firecrawl_operation(tool_name) == "firecrawl_scrape":
+        if args.get("actions"):
+            return {"action": "block", "message": "Customer Map allows Firecrawl page reading, not interactive browser actions."}
+        if not _safe_public_url(args.get("url")):
+            return {"action": "block", "message": "Customer Map Firecrawl can only read public HTTP(S) URLs."}
+    content = _tool_activity(tool_name, args)
     if content:
         _report_tool_activity(kwargs.get("session_id"), content)
 
@@ -434,10 +444,20 @@ def _on_post_tool_call(**kwargs):
     if str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
         return
     tool_name = str(kwargs.get("tool_name") or "")
-    if tool_name not in {"web_search", "web_extract"}:
+    labels = {
+        "web_search": "搜索",
+        "web_extract": "页面读取",
+        "skills_list": "技能列表读取",
+        "skill_view": "技能加载",
+    }
+    operation = firecrawl_operation(tool_name)
+    label = labels.get(tool_name) or {
+        "firecrawl_search": "深度搜索",
+        "firecrawl_scrape": "深度读取",
+    }.get(operation)
+    if not label:
         return
     failed = kwargs.get("status") in {"error", "blocked"} or bool(kwargs.get("error_type"))
-    label = "搜索" if tool_name == "web_search" else "页面读取"
     _report_tool_activity(kwargs.get("session_id"), f"{label}{'失败，正在尝试其他方式' if failed else '完成'}")
 
 
@@ -456,6 +476,22 @@ def _public_hostname(value):
         return ""
 
 
+def _safe_public_url(value):
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(value))
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in {"http", "https"} or not host or host == "localhost" or host.endswith(".localhost"):
+            return False
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:
+            return True
+    except Exception:
+        return False
+
+
 def _tool_activity(tool_name, args):
     args = args if isinstance(args, dict) else {}
     if tool_name == "web_search":
@@ -465,6 +501,18 @@ def _tool_activity(tool_name, args):
         urls = args.get("urls") if isinstance(args.get("urls"), list) else []
         detail = "、".join(filter(None, (_public_hostname(url) for url in urls[:3])))
         return f"正在读取：{detail}" if detail else "正在读取公开网页"
+    operation = firecrawl_operation(tool_name)
+    if operation == "firecrawl_search":
+        detail = str(args.get("query") or "").strip()[:180]
+        return f"正在深度搜索：{detail}" if detail else "正在深度搜索公开网页"
+    if operation == "firecrawl_scrape":
+        detail = _public_hostname(args.get("url"))
+        return f"正在深度读取：{detail}" if detail else "正在深度读取公开网页"
+    if tool_name == "skills_list":
+        return "正在查看可用技能"
+    if tool_name == "skill_view":
+        detail = str(args.get("name") or "").strip()[:120]
+        return f"正在加载技能：{detail}" if detail else "正在加载技能"
     return ""
 
 
@@ -495,18 +543,12 @@ def register(ctx):
 
 
 def _register_safe_platform_toolset():
-    """Give Hermes a narrow default for this plugin platform.
+    """Give Hermes a narrow read-only toolset for this plugin platform.
 
     Without an explicit composite, Hermes treats an unknown plugin platform as
     a full core-tool platform before per-platform settings are applied.
     """
-    from toolsets import TOOLSETS
-
-    TOOLSETS["hermes-customer_map"] = {
-        "description": "Customer Map read-only web research tools",
-        "tools": ["web_search", "web_extract"],
-        "includes": [],
-    }
+    register_customer_map_toolset()
 
 
 def _normalize_mail_action(value):

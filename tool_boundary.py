@@ -5,13 +5,62 @@ import stat
 import tempfile
 from pathlib import Path
 
-SAFE_PLATFORM_TOOLSETS = ["web", "no_mcp"]
-ALLOWED_EFFECTIVE_TOOLSETS = {"web"}
-ALLOWED_EFFECTIVE_TOOLS = {"web_search", "web_extract"}
+SAFE_TOOLSET_NAME = "customer-map-readonly"
+SAFE_PLATFORM_TOOLSETS = [SAFE_TOOLSET_NAME, "no_mcp"]
+# Hermes reverse-maps the complete built-in web subset from this composite.
+ALLOWED_EFFECTIVE_TOOLSETS = {SAFE_TOOLSET_NAME, "web"}
+BASE_ALLOWED_EFFECTIVE_TOOLS = {
+    "web_search",
+    "web_extract",
+    "skills_list",
+    "skill_view",
+}
+FIRECRAWL_READ_TOOLS = {"firecrawl_search", "firecrawl_scrape"}
+
+
+def allowed_effective_tools():
+    return BASE_ALLOWED_EFFECTIVE_TOOLS | _registered_firecrawl_read_tools()
+
+
+def firecrawl_operation(tool_name):
+    if tool_name not in _registered_firecrawl_read_tools():
+        return ""
+    return next((name for name in FIRECRAWL_READ_TOOLS if tool_name == name or tool_name.endswith(f"__{name}")), "")
+
+
+def register_customer_map_toolset():
+    from toolsets import TOOLSETS
+
+    TOOLSETS[SAFE_TOOLSET_NAME] = {
+        "description": "Customer Map read-only web research and installed skill loading",
+        "tools": sorted(allowed_effective_tools()),
+        "includes": [],
+    }
+
+
+def _registered_firecrawl_read_tools():
+    try:
+        from tools.registry import registry
+
+        if hasattr(registry, "get_all_entries"):
+            registered = ((entry.name, entry.toolset) for entry in registry.get_all_entries())
+        else:
+            registered = ((name, registry.get_toolset_for_tool(name)) for name in registry.get_all_tool_names())
+        matches = set()
+        for registered_name, registered_toolset in registered:
+            toolset = str(registered_toolset or "").lower()
+            name = str(registered_name or "")
+            if "firecrawl" not in toolset:
+                continue
+            if any(name == raw or name.endswith(f"__{raw}") for raw in FIRECRAWL_READ_TOOLS):
+                matches.add(name)
+        return matches
+    except Exception:
+        return set()
 
 
 def ensure_customer_map_tool_boundary():
-    """Persist a web-only, no-MCP allowlist for the Customer Map platform."""
+    """Persist Customer Map's read-only research allowlist."""
     try:
         import yaml
     except ImportError as exc:
@@ -63,12 +112,13 @@ def ensure_customer_map_tool_boundary():
 
 
 def assert_customer_map_tool_boundary():
-    """Verify Hermes will expose only the connector's safe web toolset."""
+    """Verify Hermes will expose only Customer Map's read-only tools."""
     try:
         from gateway.run import _load_gateway_config
         from hermes_cli.tools_config import _get_platform_tools
         from toolsets import resolve_toolset
 
+        register_customer_map_toolset()
         config = _load_gateway_config()
         effective = set(_get_platform_tools(config, "customer_map"))
         effective_tools = {
@@ -85,7 +135,7 @@ def assert_customer_map_tool_boundary():
             + ", ".join(unexpected)
             + ". Re-run the Customer Map Hermes pairing command and restart the gateway."
         )
-    unexpected_tools = sorted(effective_tools - ALLOWED_EFFECTIVE_TOOLS)
+    unexpected_tools = sorted(effective_tools - allowed_effective_tools())
     if unexpected_tools:
         raise RuntimeError(
             "Customer Map Hermes tool isolation is not active; blocked unexpected tools: "
