@@ -26,9 +26,10 @@ except ImportError:
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.9"
+PLUGIN_VERSION = "0.5.10"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
+TOOL_SEARCH_CATALOG_TOOLS = {"tool_search", "tool_describe"}
 _ACTIVE_ADAPTERS = set()
 _ACTIVE_ADAPTERS_LOCK = threading.Lock()
 _CUSTOMER_MAP_SESSIONS = set()
@@ -428,6 +429,20 @@ def _on_pre_tool_call(**kwargs):
         return
     tool_name = str(kwargs.get("tool_name") or "")
     args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+    if tool_name in TOOL_SEARCH_CATALOG_TOOLS:
+        content = _tool_activity(tool_name, args)
+        if content:
+            _report_tool_activity(kwargs.get("session_id"), content)
+        return
+    if tool_name == "tool_call":
+        tool_name = str(args.get("name") or "")
+        nested_args = args.get("arguments")
+        if isinstance(nested_args, str):
+            try:
+                nested_args = json.loads(nested_args)
+            except json.JSONDecodeError:
+                nested_args = {}
+        args = nested_args if isinstance(nested_args, dict) else {}
     if tool_name not in allowed_effective_tools():
         return {"action": "block", "message": f"Customer Map blocked unavailable tool: {tool_name}"}
     if firecrawl_operation(tool_name) == "firecrawl_scrape":
@@ -494,6 +509,8 @@ def _safe_public_url(value):
 
 def _tool_activity(tool_name, args):
     args = args if isinstance(args, dict) else {}
+    if tool_name == "tool_search":
+        return "正在加载可用工具"
     if tool_name == "web_search":
         detail = str(args.get("query") or "").strip()[:180]
         return f"正在搜索：{detail}" if detail else "正在搜索公开网页"

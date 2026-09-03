@@ -15,7 +15,7 @@ try:
 except ImportError:
     from tool_boundary import ensure_customer_map_tool_boundary
 
-PLUGIN_VERSION = "0.5.9"
+PLUGIN_VERSION = "0.5.10"
 
 
 def main():

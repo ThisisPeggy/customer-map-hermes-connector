@@ -193,6 +193,17 @@ def _check_tool_call_boundary():
         session_id="customer-map-session", tool_name="skills_list", args={}
     ) is None
     assert module._on_pre_tool_call(
+        session_id="customer-map-session", tool_name="tool_search", args={"query": "firecrawl"}
+    ) is None
+    assert module._on_pre_tool_call(
+        session_id="customer-map-session", tool_name="tool_describe", args={"name": "mcp__my_firecrawl__firecrawl_scrape"}
+    ) is None
+    assert module._on_pre_tool_call(
+        session_id="customer-map-session",
+        tool_name="tool_call",
+        args={"name": "mcp__my_firecrawl__firecrawl_scrape", "arguments": {"url": "https://example.com/about"}},
+    ) is None
+    assert module._on_pre_tool_call(
         session_id="customer-map-session",
         tool_name="mcp__my_firecrawl__firecrawl_scrape",
         args={"url": "https://example.com/about"},
@@ -211,6 +222,21 @@ def _check_tool_call_boundary():
     )
     assert blocked_url["action"] == "block"
     assert "public HTTP(S)" in blocked_url["message"]
+    blocked_bridge_action = module._on_pre_tool_call(
+        session_id="customer-map-session",
+        tool_name="tool_call",
+        args={
+            "name": "mcp__my_firecrawl__firecrawl_scrape",
+            "arguments": {"url": "https://example.com", "actions": [{"type": "click"}]},
+        },
+    )
+    assert blocked_bridge_action["action"] == "block"
+    blocked_bridge_tool = module._on_pre_tool_call(
+        session_id="customer-map-session",
+        tool_name="tool_call",
+        args={"name": "terminal", "arguments": {"command": "whoami"}},
+    )
+    assert blocked_bridge_tool["action"] == "block"
     blocked_tool = module._on_pre_tool_call(
         session_id="customer-map-session", tool_name="skill_manage", args={}
     )
