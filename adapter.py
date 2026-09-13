@@ -26,9 +26,10 @@ except ImportError:
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.5.10"
+PLUGIN_VERSION = "0.6.0"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
+NOTIFICATION_CACHE_LIMIT = 500
 TOOL_SEARCH_CATALOG_TOOLS = {"tool_search", "tool_describe"}
 _ACTIVE_ADAPTERS = set()
 _ACTIVE_ADAPTERS_LOCK = threading.Lock()
@@ -56,6 +57,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
         self._job_tasks = set()
         self._mail_action_results = _load_mail_action_results()
         self._mail_action_lock = asyncio.Lock()
+        self._notification_results = _load_notification_results()
+        self._notification_lock = asyncio.Lock()
         self._loop = None
 
     @property
@@ -196,6 +199,13 @@ class CustomerMapAdapter(BasePlatformAdapter):
             "cancelled": False,
         }
         try:
+            if request.get("notificationAction") is not None:
+                response = await self._run_notification_action(request.get("notificationAction"))
+                output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                await self._complete(job_id, response={"output_text": output_text})
+                if not completion.done():
+                    completion.set_result(output_text)
+                return
             if request.get("mailAction") is not None:
                 response = await self._run_direct_mail_action(request.get("mailAction"))
                 output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
@@ -292,6 +302,35 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 while len(self._mail_action_results) > MAIL_ACTION_CACHE_LIMIT:
                     self._mail_action_results.pop(next(iter(self._mail_action_results)))
                 _save_mail_action_results(self._mail_action_results)
+            return result
+
+    async def _run_notification_action(self, value):
+        try:
+            action = _normalize_notification_action(value)
+        except ValueError as exc:
+            return _notification_action_result(value, "failed", error=str(exc))
+        async with self._notification_lock:
+            cached = self._notification_results.get(action["actionId"])
+            if cached:
+                if cached["bodyHash"] != action["bodyHash"]:
+                    return _notification_action_result(action, "failed", error="Notification action id was reused with different content.")
+                return cached["result"]
+            try:
+                from tools.send_message_tool import send_message_tool
+                raw = await asyncio.to_thread(send_message_tool, {
+                    "action": "send", "target": action["channel"], "message": action["message"],
+                })
+                delivered = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(delivered, dict) or delivered.get("success") is not True:
+                    raise RuntimeError(str((delivered or {}).get("error") if isinstance(delivered, dict) else delivered) or "Weixin delivery failed.")
+                result = _notification_action_result(action, "succeeded", message_id=str(delivered.get("message_id") or ""))
+            except Exception as exc:
+                result = _notification_action_result(action, "failed", error=str(exc))
+            if result["notificationReceipt"]["status"] == "succeeded":
+                self._notification_results[action["actionId"]] = {"bodyHash": action["bodyHash"], "result": result}
+                while len(self._notification_results) > NOTIFICATION_CACHE_LIMIT:
+                    self._notification_results.pop(next(iter(self._notification_results)))
+                _save_notification_results(self._notification_results)
             return result
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
@@ -411,6 +450,7 @@ def _capabilities():
         "mailBackendMode": configured_mail_backend(),
         "conversationalToolBoundary": "research-read-only",
         "memory": "unknown",
+        "secretaryNotification": "verified",
     }
 
 
@@ -610,6 +650,39 @@ def _normalize_mail_action(value):
     }
 
 
+def _normalize_notification_action(value):
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("Unsupported Customer Map notification version.")
+    action_id = str(value.get("actionId") or "").strip().lower()
+    channel = str(value.get("channel") or "").strip().lower()
+    message = str(value.get("message") or "").strip()
+    body_hash = str(value.get("bodyHash") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", action_id):
+        raise ValueError("Invalid Customer Map notification action id.")
+    if channel != "weixin":
+        raise ValueError("Customer Map secretary notifications may only use the Weixin home channel.")
+    if not message or len(message) > 12000:
+        raise ValueError("Customer Map notification is empty or too large.")
+    expected_hash = hashlib.sha256(f"{channel}\n{message}".encode("utf-8")).hexdigest()
+    if body_hash != expected_hash:
+        raise ValueError("Notification body integrity check failed.")
+    return {"version": 1, "actionId": action_id, "channel": channel, "message": message, "bodyHash": body_hash}
+
+
+def _notification_action_result(value, status, message_id="", error=""):
+    source = value if isinstance(value, dict) else {}
+    return {
+        "reply": "微信秘书简报已投递。" if status == "succeeded" else error,
+        "notificationReceipt": {
+            "kind": "secretaryBriefing", "status": status, "channel": "weixin",
+            "messageId": message_id, "error": error,
+            "bodyHash": str(source.get("bodyHash") or ""),
+            "actionId": str(source.get("actionId") or ""),
+            "occurredAt": datetime.now(timezone.utc).isoformat() if status == "succeeded" else "",
+        },
+    }
+
+
 def _mail_action_result(
     value,
     status,
@@ -705,6 +778,50 @@ def _save_mail_action_results(results):
             json.dump(results, handle, ensure_ascii=False, separators=(",", ":"))
             handle.write("\n")
         os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _notification_cache_path():
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return home / ".customer-map-notifications.json"
+
+
+def _load_notification_results():
+    path = _notification_cache_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception as exc:
+        logger.warning("Could not read Customer Map notification cache: %s", exc)
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    results = {}
+    for action_id, entry in list(value.items())[-NOTIFICATION_CACHE_LIMIT:]:
+        if not re.fullmatch(r"[0-9a-f]{32}", str(action_id)) or not isinstance(entry, dict):
+            continue
+        body_hash = str(entry.get("bodyHash") or "")
+        result = entry.get("result")
+        receipt = result.get("notificationReceipt") if isinstance(result, dict) else None
+        if not re.fullmatch(r"[0-9a-f]{64}", body_hash) or not isinstance(receipt, dict):
+            continue
+        if receipt.get("status") != "succeeded" or receipt.get("channel") != "weixin":
+            continue
+        results[str(action_id)] = {"bodyHash": body_hash, "result": result}
+    return results
+
+
+def _save_notification_results(results):
+    path = _notification_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(results, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+        os.chmod(temp_path, 0o600)
         os.replace(temp_path, path)
     finally:
         if os.path.exists(temp_path):

@@ -29,6 +29,8 @@ def _load_adapter():
     tools_config = types.ModuleType("hermes_cli.tools_config")
     tools = types.ModuleType("tools")
     tools_registry = types.ModuleType("tools.registry")
+    tools_send_message = types.ModuleType("tools.send_message_tool")
+    tools_send_message.send_message_tool = lambda args: json.dumps({"success": True, "message_id": "wx-test"})
     toolsets = types.ModuleType("toolsets")
     toolsets.TOOLSETS = {}
     toolsets.resolve_toolset = lambda name: list(toolsets.TOOLSETS.get(name, {}).get("tools", []))
@@ -94,12 +96,39 @@ def _load_adapter():
         "hermes_cli.tools_config": tools_config,
         "tools": tools,
         "tools.registry": tools_registry,
+        "tools.send_message_tool": tools_send_message,
         "toolsets": toolsets,
     })
     spec = importlib.util.spec_from_file_location("customer_map_adapter_test", ROOT / "adapter.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+async def _check_secretary_notification_delivery():
+    module = _load_adapter()
+    with tempfile.TemporaryDirectory() as home:
+        previous_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = home
+        try:
+            adapter = module.CustomerMapAdapter({})
+            message = "早上好，今天有 3 项客户跟进。"
+            body_hash = __import__("hashlib").sha256(f"weixin\n{message}".encode()).hexdigest()
+            action = {"version": 1, "actionId": "a" * 32, "channel": "weixin", "message": message, "bodyHash": body_hash}
+            first = await adapter._run_notification_action(action)
+            second = await adapter._run_notification_action(action)
+            assert first["notificationReceipt"]["status"] == "succeeded"
+            assert first == second
+            changed_message = "changed"
+            changed_hash = __import__("hashlib").sha256(f"weixin\n{changed_message}".encode()).hexdigest()
+            changed = await adapter._run_notification_action({**action, "message": changed_message, "bodyHash": changed_hash})
+            assert changed["notificationReceipt"]["status"] == "failed"
+            assert "reused with different content" in changed["notificationReceipt"]["error"]
+        finally:
+            if previous_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = previous_home
 
 
 async def _check_async_final_response():
@@ -832,6 +861,7 @@ if __name__ == "__main__":
     asyncio.run(_check_himalaya_backend_mapping())
     asyncio.run(_check_mail_backend_auto_detection())
     asyncio.run(_check_persistent_mail_action_idempotency())
+    asyncio.run(_check_secretary_notification_delivery())
     asyncio.run(_check_conversational_tool_boundary_fails_closed())
     asyncio.run(_check_rejects_stdin_body())
     asyncio.run(_check_websocket_reconnect())
