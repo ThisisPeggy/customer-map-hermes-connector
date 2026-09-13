@@ -10,6 +10,7 @@ import re
 import stat
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +27,7 @@ except ImportError:
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.6.1"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 NOTIFICATION_CACHE_LIMIT = 500
@@ -59,6 +60,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
         self._mail_action_lock = asyncio.Lock()
         self._notification_results = _load_notification_results()
         self._notification_lock = asyncio.Lock()
+        self._weixin_setup = None
+        self._weixin_setup_task = None
         self._loop = None
 
     @property
@@ -90,6 +93,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
             self._receive_task.cancel()
         for task in list(self._job_tasks):
             task.cancel()
+        if self._weixin_setup_task:
+            self._weixin_setup_task.cancel()
         self._fail_pending("Customer Map relay disconnected")
         await self._close_transport()
         self._receive_task = self._reconnect_task = None
@@ -199,6 +204,13 @@ class CustomerMapAdapter(BasePlatformAdapter):
             "cancelled": False,
         }
         try:
+            if request.get("weixinSetupAction") is not None:
+                response = await self._run_weixin_setup_action(request.get("weixinSetupAction"))
+                output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                await self._complete(job_id, response={"output_text": output_text})
+                if not completion.done():
+                    completion.set_result(output_text)
+                return
             if request.get("notificationAction") is not None:
                 response = await self._run_notification_action(request.get("notificationAction"))
                 output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
@@ -333,6 +345,33 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 _save_notification_results(self._notification_results)
             return result
 
+    async def _run_weixin_setup_action(self, value):
+        action = value if isinstance(value, dict) else {}
+        if action.get("version") != 1:
+            return _weixin_setup_result("failed", error="Unsupported Weixin setup version.")
+        kind = str(action.get("action") or "status").strip().lower()
+        setup_id = str(action.get("setupId") or "").strip().lower()
+        if kind == "start":
+            if self._weixin_setup_task and not self._weixin_setup_task.done():
+                self._weixin_setup_task.cancel()
+            self._weixin_setup = await _start_weixin_setup()
+            self._weixin_setup_task = asyncio.create_task(_poll_weixin_setup(self._weixin_setup))
+        elif kind == "cancel":
+            if self._weixin_setup_task:
+                self._weixin_setup_task.cancel()
+            self._weixin_setup_task = None
+            self._weixin_setup = None
+            return _weixin_setup_result("cancelled")
+        elif kind != "status":
+            return _weixin_setup_result("failed", error="Unknown Weixin setup action.")
+        state = self._weixin_setup
+        if not state or (setup_id and setup_id != state["setupId"]):
+            return _weixin_setup_result("missing", error="Weixin setup session was not found.")
+        return _weixin_setup_result(
+            state["status"], setup_id=state["setupId"], qr_payload=state.get("qrPayload", ""),
+            expires_at=state.get("expiresAt", 0), error=state.get("error", ""),
+        )
+
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         pending = self._pending.get(str(chat_id))
         if not pending:
@@ -451,6 +490,7 @@ def _capabilities():
         "conversationalToolBoundary": "research-read-only",
         "memory": "unknown",
         "secretaryNotification": "verified",
+        "weixinWebSetup": "verified",
     }
 
 
@@ -667,6 +707,106 @@ def _normalize_notification_action(value):
     if body_hash != expected_hash:
         raise ValueError("Notification body integrity check failed.")
     return {"version": 1, "actionId": action_id, "channel": channel, "message": message, "bodyHash": body_hash}
+
+
+async def _start_weixin_setup():
+    from gateway.platforms.weixin import (
+        EP_GET_BOT_QR, ILINK_BASE_URL, QR_TIMEOUT_MS, _api_get, _make_ssl_connector,
+    )
+    session = ClientSession(trust_env=True, connector=_make_ssl_connector())
+    try:
+        payload = await _api_get(
+            session, base_url=ILINK_BASE_URL,
+            endpoint=f"{EP_GET_BOT_QR}?bot_type=3", timeout_ms=QR_TIMEOUT_MS,
+        )
+        qrcode_value = str(payload.get("qrcode") or "").strip()
+        qr_payload = str(payload.get("qrcode_img_content") or qrcode_value).strip()
+        if not qrcode_value or not qr_payload:
+            raise RuntimeError("Weixin did not return a QR code.")
+        return {
+            "setupId": uuid.uuid4().hex,
+            "status": "waiting",
+            "qrPayload": qr_payload,
+            "qrcode": qrcode_value,
+            "baseUrl": ILINK_BASE_URL,
+            "expiresAt": int((time.time() + 480) * 1000),
+            "session": session,
+            "error": "",
+        }
+    except Exception:
+        await session.close()
+        raise
+
+
+async def _poll_weixin_setup(state):
+    from gateway.platforms.weixin import EP_GET_QR_STATUS, ILINK_BASE_URL, QR_TIMEOUT_MS, _api_get, save_weixin_account
+    from hermes_cli.config import get_hermes_home, save_env_value
+    session = state["session"]
+    try:
+        while time.time() * 1000 < state["expiresAt"]:
+            payload = await _api_get(
+                session, base_url=state.get("baseUrl") or ILINK_BASE_URL,
+                endpoint=f"{EP_GET_QR_STATUS}?qrcode={state['qrcode']}", timeout_ms=QR_TIMEOUT_MS,
+            )
+            status = str(payload.get("status") or "wait")
+            if status == "scaned":
+                state["status"] = "scanned"
+            elif status == "scaned_but_redirect":
+                redirect_host = str(payload.get("redirect_host") or "").strip()
+                if redirect_host:
+                    state["baseUrl"] = f"https://{redirect_host}"
+            elif status == "confirmed":
+                account_id = str(payload.get("ilink_bot_id") or "").strip()
+                token = str(payload.get("bot_token") or "").strip()
+                base_url = str(payload.get("baseurl") or state.get("baseUrl") or ILINK_BASE_URL).strip()
+                user_id = str(payload.get("ilink_user_id") or "").strip()
+                if not account_id or not token or not user_id:
+                    raise RuntimeError("Weixin confirmed the QR code but returned incomplete credentials.")
+                save_weixin_account(str(get_hermes_home()), account_id=account_id, token=token, base_url=base_url, user_id=user_id)
+                values = {
+                    "WEIXIN_ACCOUNT_ID": account_id,
+                    "WEIXIN_TOKEN": token,
+                    "WEIXIN_BASE_URL": base_url,
+                    "WEIXIN_CDN_BASE_URL": "https://novac2c.cdn.weixin.qq.com/c2c",
+                    "WEIXIN_DM_POLICY": "allowlist",
+                    "WEIXIN_ALLOW_ALL_USERS": "false",
+                    "WEIXIN_ALLOWED_USERS": user_id,
+                    "WEIXIN_GROUP_POLICY": "disabled",
+                    "WEIXIN_GROUP_ALLOWED_USERS": "",
+                    "WEIXIN_HOME_CHANNEL": user_id,
+                    "WEIXIN_HOME_CHANNEL_NAME": "Customer Map Secretary",
+                }
+                for key, value in values.items():
+                    save_env_value(key, value)
+                    os.environ[key] = value
+                state["status"] = "connected"
+                state["qrPayload"] = ""
+                return
+            elif status == "expired":
+                state["status"] = "expired"
+                state["error"] = "Weixin QR code expired. Start again."
+                return
+            await asyncio.sleep(1)
+        state["status"] = "expired"
+        state["error"] = "Weixin QR code expired. Start again."
+    except asyncio.CancelledError:
+        state["status"] = "cancelled"
+        raise
+    except Exception as exc:
+        state["status"] = "failed"
+        state["error"] = str(exc)[:500]
+    finally:
+        state.pop("session", None)
+        await session.close()
+
+
+def _weixin_setup_result(status, setup_id="", qr_payload="", expires_at=0, error=""):
+    return {
+        "weixinSetup": {
+            "status": status, "setupId": setup_id, "qrPayload": qr_payload,
+            "expiresAt": expires_at, "error": error,
+        }
+    }
 
 
 def _notification_action_result(value, status, message_id="", error=""):

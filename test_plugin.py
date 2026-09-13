@@ -131,6 +131,32 @@ async def _check_secretary_notification_delivery():
                 os.environ["HERMES_HOME"] = previous_home
 
 
+async def _check_weixin_web_setup_protocol():
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+
+    async def start():
+        return {
+            "setupId": "b" * 32, "status": "waiting", "qrPayload": "https://weixin.example/qr",
+            "expiresAt": 9999999999999, "error": "", "session": object(),
+        }
+
+    async def poll(state):
+        await asyncio.sleep(0)
+        state["status"] = "connected"
+        state["qrPayload"] = ""
+
+    module._start_weixin_setup = start
+    module._poll_weixin_setup = poll
+    started = await adapter._run_weixin_setup_action({"version": 1, "action": "start"})
+    assert started["weixinSetup"]["status"] == "waiting"
+    assert started["weixinSetup"]["qrPayload"] == "https://weixin.example/qr"
+    await adapter._weixin_setup_task
+    status = await adapter._run_weixin_setup_action({"version": 1, "action": "status", "setupId": "b" * 32})
+    assert status["weixinSetup"]["status"] == "connected"
+    assert status["weixinSetup"]["qrPayload"] == ""
+
+
 async def _check_async_final_response():
     module = _load_adapter()
     adapter = module.CustomerMapAdapter({})
@@ -862,6 +888,7 @@ if __name__ == "__main__":
     asyncio.run(_check_mail_backend_auto_detection())
     asyncio.run(_check_persistent_mail_action_idempotency())
     asyncio.run(_check_secretary_notification_delivery())
+    asyncio.run(_check_weixin_web_setup_protocol())
     asyncio.run(_check_conversational_tool_boundary_fails_closed())
     asyncio.run(_check_rejects_stdin_body())
     asyncio.run(_check_websocket_reconnect())
