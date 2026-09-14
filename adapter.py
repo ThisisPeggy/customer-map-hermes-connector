@@ -2,12 +2,15 @@
 
 import asyncio
 import hashlib
+import importlib
 import ipaddress
 import json
 import logging
 import os
 import re
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -27,7 +30,7 @@ except ImportError:
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.6.1"
+PLUGIN_VERSION = "0.6.2"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 NOTIFICATION_CACHE_LIMIT = 500
@@ -779,8 +782,17 @@ async def _poll_weixin_setup(state):
                 for key, value in values.items():
                     save_env_value(key, value)
                     os.environ[key] = value
+                state["status"] = "preparing"
+                try:
+                    await asyncio.to_thread(_prepare_weixin_voice_support)
+                    state["voiceReady"] = True
+                except Exception as exc:
+                    logger.warning("Weixin voice support setup failed: %s", exc)
+                    state["voiceReady"] = False
+                    state["voiceError"] = str(exc)[:500]
                 state["status"] = "connected"
                 state["qrPayload"] = ""
+                asyncio.create_task(_restart_gateway_after_weixin_setup())
                 return
             elif status == "expired":
                 state["status"] = "expired"
@@ -807,6 +819,30 @@ def _weixin_setup_result(status, setup_id="", qr_payload="", expires_at=0, error
             "expiresAt": expires_at, "error": error,
         }
     }
+
+
+def _prepare_weixin_voice_support():
+    """Install Hermes' pinned local Weixin voice decoder and STT fallback."""
+    from tools.lazy_deps import ensure
+    ensure("stt.silk", prompt=False)
+    ensure("stt.faster_whisper", prompt=False)
+    importlib.invalidate_caches()
+
+
+async def _restart_gateway_after_weixin_setup():
+    """Reload the newly configured inbound adapter after the web response lands."""
+    await asyncio.sleep(8)
+    hermes = Path(sys.executable).with_name("hermes")
+    command = [str(hermes if hermes.is_file() else "hermes"), "gateway", "restart"]
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(command, **kwargs)
+    except Exception as exc:
+        logger.warning("Automatic Hermes gateway restart after Weixin setup failed: %s", exc)
 
 
 def _notification_action_result(value, status, message_id="", error=""):
