@@ -7,14 +7,15 @@ from pathlib import Path
 
 SAFE_TOOLSET_NAME = "customer-map-readonly"
 PLATFORM_DEFAULT_TOOLSET_NAME = "hermes-customer_map"
-SAFE_PLATFORM_TOOLSETS = [SAFE_TOOLSET_NAME, "no_mcp"]
+SAFE_PLATFORM_TOOLSETS = [SAFE_TOOLSET_NAME, "customer-map-data", "no_mcp"]
 # Hermes reverse-maps the complete built-in web subset from this composite.
-ALLOWED_EFFECTIVE_TOOLSETS = {SAFE_TOOLSET_NAME, "web"}
+ALLOWED_EFFECTIVE_TOOLSETS = {SAFE_TOOLSET_NAME, "customer-map-data", "web"}
 BASE_ALLOWED_EFFECTIVE_TOOLS = {
     "web_search",
     "web_extract",
     "skills_list",
     "skill_view",
+    "customer_map_query",
 }
 FIRECRAWL_READ_TOOLS = {"firecrawl_search", "firecrawl_scrape"}
 
@@ -33,7 +34,7 @@ def register_customer_map_toolset():
     from toolsets import TOOLSETS
 
     definition = {
-        "description": "Customer Map read-only web research and installed skill loading",
+        "description": "Customer Map read-only business queries, web research, and installed skill loading",
         "tools": sorted(allowed_effective_tools()),
         "includes": [],
     }

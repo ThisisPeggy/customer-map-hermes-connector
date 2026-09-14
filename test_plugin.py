@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small dependency-free checks for the Customer Map Hermes plugin."""
+"""Isolated checks for the Customer Map Hermes plugin (aiohttp and PyYAML)."""
 
 import asyncio
 import importlib.util
@@ -10,6 +10,7 @@ import tempfile
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from aiohttp import web
 
 ROOT = Path(__file__).parent
@@ -107,10 +108,17 @@ def _load_adapter():
 
 async def _check_secretary_notification_delivery():
     module = _load_adapter()
-    with tempfile.TemporaryDirectory() as home:
+    with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {
+        "CUSTOMER_MAP_HERMES_SITE": "https://customer-map.test",
+        "CUSTOMER_MAP_HERMES_CONNECTION_ID": "test-connection",
+        "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "test-token",
+        "WEIXIN_ACCOUNT_ID": "wxid_bot", "WEIXIN_TOKEN": "weixin-test-token",
+        "WEIXIN_HOME_CHANNEL": "wxid_owner",
+    }):
         previous_home = os.environ.get("HERMES_HOME")
         os.environ["HERMES_HOME"] = home
         try:
+            module.save_weixin_binding({"setupId": "b" * 32, "bindingFingerprint": module.binding_fingerprint()}, "wxid_bot", "wxid_owner")
             adapter = module.CustomerMapAdapter({})
             message = "早上好，今天有 3 项客户跟进。"
             body_hash = __import__("hashlib").sha256(f"weixin\n{message}".encode()).hexdigest()
@@ -860,6 +868,7 @@ def _check_safe_platform_composite():
     module._register_safe_platform_toolset()
     definition = sys.modules["toolsets"].TOOLSETS["customer-map-readonly"]
     assert definition["tools"] == [
+        "customer_map_query",
         "mcp__my_firecrawl__firecrawl_scrape", "mcp__my_firecrawl__firecrawl_search",
         "skill_view", "skills_list", "web_extract", "web_search",
     ]
@@ -870,7 +879,7 @@ def _check_safe_platform_composite():
     assert "emailVerification" not in module._capabilities()
 
 
-if __name__ == "__main__":
+def run_checks():
     _check_env_write()
     _check_safe_platform_composite()
     _check_safe_tool_activity()
@@ -893,3 +902,14 @@ if __name__ == "__main__":
     asyncio.run(_check_rejects_stdin_body())
     asyncio.run(_check_websocket_reconnect())
     print("Hermes plugin checks passed")
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="customer-map-plugin-test-") as directory:
+        with patch.dict(os.environ, {
+            "HERMES_HOME": directory,
+            "CUSTOMER_MAP_HERMES_SITE": "https://customer-map.test",
+            "CUSTOMER_MAP_HERMES_CONNECTION_ID": "test-connection",
+            "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "test-bridge-token",
+        }):
+            run_checks()

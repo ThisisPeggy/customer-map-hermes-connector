@@ -2,7 +2,35 @@
 
 This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Customer Map polls queued/running relay jobs automatically and can run another foreground turn when Hermes explicitly returns `continue: true`. A timed-out task is terminal and does not continue in the background.
 
-Version 0.6.2 prepares Hermes' pinned SILK decoder and local speech-to-text fallback during Customer Map's in-browser Weixin QR authorization, then automatically restarts the gateway after the web flow completes so inbound text and voice messages work without terminal setup. The QR session and credentials stay on the user's Hermes machine; direct messages are restricted to the scanning user, and that private chat becomes the secretary delivery target automatically. It retains 0.6.0's integrity-hashed, idempotent, Weixin-only deterministic notifications. Ordinary Customer Map turns remain on a fail-closed, read-only allowlist, including overriding Hermes' full-core fallback for unknown plugin platforms. Built-in web search and extraction remain available. If the user has an MCP server named with `firecrawl`, only its standard `firecrawl_search` and non-interactive `firecrawl_scrape` tools are exposed; the connector does not change that server's configuration or API key. Hermes' scoped `tool_search`, `tool_describe`, and `tool_call` bridge may load those deferred Firecrawl tools without bypassing the same target and argument checks. Scrape calls are limited to public HTTP(S) URLs. Installed skills can be listed and loaded through `skills_list` and `skill_view`, while `skill_manage` remains blocked. Raw `session_search` is not exposed because Hermes does not currently provide a Customer Map-only source filter. Terminal, files, code execution, delegation, kanban, cron, arbitrary MCP, memory writes, and model-driven mail commands remain unavailable. Customer Map mail and notification actions bypass the model and enter dedicated adapters.
+Version 0.7.0 adds the `customer_map_query` tool for live, read-only business queries from the Customer Map workspace and its authorized Weixin owner chat. Every owner-chat turn receives secretary instructions: understand text or a voice transcript as the user's request, query real records when needed, and answer directly. Translation is performed only when requested. Native Hermes still handles speech recognition and Weixin delivery; this plugin does not promise native outbound voice bubbles.
+
+Successful QR authorization is saved before voice preparation and survives gateway restarts. The record is tied to the current Customer Map site, connection credential, Weixin bot, and scanning user, and contains no raw tokens or QR payload. Changing the Customer Map binding does not authorize an old Weixin recipient to read the new account. Notifications require the same binding, target that exact recipient, and deduplicate successful delivery per binding and action ID. Their text-only protocol rejects local attachment directives.
+
+The plugin retains SILK decoder and local speech-to-text preparation during QR setup, followed by an automatic gateway restart. Direct messages are restricted to the scanning user. Ordinary Customer Map turns retain a fail-closed, read-only allowlist, including on restored sessions: business queries, built-in web search/extraction, and installed skill loading. A configured Firecrawl MCP server contributes only `firecrawl_search` and non-interactive, public-URL `firecrawl_scrape`. The scoped `tool_search`, `tool_describe`, and `tool_call` bridge cannot bypass these checks. Terminal, files, code execution, delegation, kanban, cron, arbitrary MCP, memory writes, raw session search, and model-driven mail remain unavailable on the Customer Map platform. Native tools on unrelated Hermes platforms are not reconfigured.
+
+## Business query API
+
+Deploy Customer Map's matching `/api/agent-data` implementation before using 0.7.0 queries. Requests use `POST {"runtime":"hermes","query":{...}}` and the bound bridge token in the Authorization header. The server determines the account and calculates totals; the model cannot override identity, credentials, endpoints, tables, or SQL. Requests have a 25-second timeout and a bounded response size, and never follow redirects with the credential.
+
+| Operation | Records returned |
+| --- | --- |
+| `capabilities` | Available queries and source coverage |
+| `work_summary` | Exact new-customer, sent-mail, detected-reply, bounce, created-quote and completed-follow-up counts |
+| `customers` | Company/country/current-status filters, IDs and pagination |
+| `customer_detail` | One customer's business information |
+| `quotes` | Quotes for a customer; a quote ID includes line items |
+| `follow_ups` | Scheduled customer and quote tasks, due dates and overdue filtering |
+| `mail_activity` | Sent, detected-reply or recorded-bounce events |
+
+Date ranges use the user's saved timezone unless explicitly overridden. A created quote may be a draft; detected replies cover synced events, not every mailbox. Current inquiry-state customers are queryable, but independent inquiry counts are unavailable. Charts, inquiry creation and custom task management are not implemented by this version. Customer-owned Supabase projects that the website server cannot access return an explicit error instead of querying a different project.
+
+The tool checks both per-dispatch routing and Hermes' concurrent session context on every call. It refuses unrelated chats, groups, contextless calls and stale bindings, even if the tool is visible in another platform's tool catalog. It never reads data during the pre-dispatch hook, which runs before native gateway authorization.
+
+## Upgrading from 0.6.x
+
+After updating the website and plugin, restart the intended Hermes profile, then use **Authorize again / 重新扫码授权** in Customer Map's WeChat secretary settings once. Old home-channel settings alone do not prove which Customer Map account authorized them. No new Customer Map pairing is needed if the existing bridge binding is unchanged. If `customer-map-data` was explicitly disabled in Hermes' Weixin tool settings, enable it there.
+
+WeChat's authorization page currently calls this iLink connection **OpenClaw** (`bot_type=3` in the native QR request). Hermes still handles the conversation. That name is supplied by WeChat, not this plugin's label. When WeChat displays a replacement warning, confirming the new connection disconnects the previously linked assistant for that WeChat account.
 
 The connector still streams Hermes response drafts, reports visible research/skill activity, and supports true task cancellation: stopping a turn cancels the matching in-flight Hermes session instead of only stopping browser polling. When Firecrawl is absent or unavailable, Hermes can continue with the built-in web tools.
 
@@ -30,14 +58,22 @@ During local development:
 
 ```bash
 mkdir -p ~/.hermes/plugins/customer-map-platform
-cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py ~/.hermes/plugins/customer-map-platform/
+cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py agent_data.py secretary_context.py weixin_binding.py ~/.hermes/plugins/customer-map-platform/
 python3 ~/.hermes/plugins/customer-map-platform/connect.py --site https://your-customer-map.example --code CMAP-HERMES-...
 hermes gateway restart
 ```
 
-Verify the installation with:
+Check the installation on the intended Hermes machine with:
 
 ```bash
 hermes plugins list
-python3 ~/.hermes/plugins/customer-map-platform/test_plugin.py
 ```
+
+Run source tests independently of any installed profile (requires `aiohttp` and `PyYAML`):
+
+```bash
+python3 -B test_secretary.py
+python3 -B test_plugin.py
+```
+
+Both suites isolate profile state in temporary directories and mock messages, credentials, voice preparation and gateway restarts. The existing reconnect test additionally listens on a temporary loopback socket. No suite pairs or operates a live Hermes profile.

@@ -23,14 +23,20 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 try:
+    from .agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
     from .mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
+    from .secretary_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from .tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
+    from .weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 except ImportError:
+    from agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
     from mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
+    from secretary_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
+    from weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.6.2"
+PLUGIN_VERSION = "0.7.0"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 NOTIFICATION_CACHE_LIMIT = 500
@@ -65,6 +71,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
         self._notification_lock = asyncio.Lock()
         self._weixin_setup = None
         self._weixin_setup_task = None
+        self._weixin_setup_lock = asyncio.Lock()
         self._loop = None
 
     @property
@@ -325,7 +332,11 @@ class CustomerMapAdapter(BasePlatformAdapter):
         except ValueError as exc:
             return _notification_action_result(value, "failed", error=str(exc))
         async with self._notification_lock:
-            cached = self._notification_results.get(action["actionId"])
+            binding = load_weixin_binding()
+            if not binding:
+                return _notification_action_result(action, "failed", error="请在 Customer Map 重新扫码授权微信，确认此账号的秘书消息接收人。")
+            cache_id = hashlib.sha256(f"{binding['fingerprint']}:{binding['accountId']}:{binding['userId']}:{action['actionId']}".encode()).hexdigest()[:32]
+            cached = self._notification_results.get(cache_id)
             if cached:
                 if cached["bodyHash"] != action["bodyHash"]:
                     return _notification_action_result(action, "failed", error="Notification action id was reused with different content.")
@@ -333,7 +344,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
             try:
                 from tools.send_message_tool import send_message_tool
                 raw = await asyncio.to_thread(send_message_tool, {
-                    "action": "send", "target": action["channel"], "message": action["message"],
+                    "action": "send", "target": f"weixin:{binding['userId']}", "message": action["message"],
                 })
                 delivered = json.loads(raw) if isinstance(raw, str) else raw
                 if not isinstance(delivered, dict) or delivered.get("success") is not True:
@@ -342,37 +353,57 @@ class CustomerMapAdapter(BasePlatformAdapter):
             except Exception as exc:
                 result = _notification_action_result(action, "failed", error=str(exc))
             if result["notificationReceipt"]["status"] == "succeeded":
-                self._notification_results[action["actionId"]] = {"bodyHash": action["bodyHash"], "result": result}
+                self._notification_results[cache_id] = {"bodyHash": action["bodyHash"], "result": result}
                 while len(self._notification_results) > NOTIFICATION_CACHE_LIMIT:
                     self._notification_results.pop(next(iter(self._notification_results)))
                 _save_notification_results(self._notification_results)
             return result
 
     async def _run_weixin_setup_action(self, value):
+        async with self._weixin_setup_lock:
+            return await self._apply_weixin_setup_action(value)
+
+    async def _apply_weixin_setup_action(self, value):
         action = value if isinstance(value, dict) else {}
         if action.get("version") != 1:
             return _weixin_setup_result("failed", error="Unsupported Weixin setup version.")
         kind = str(action.get("action") or "status").strip().lower()
         setup_id = str(action.get("setupId") or "").strip().lower()
+        if setup_id and not re.fullmatch(r"[0-9a-f]{32}", setup_id):
+            return _weixin_setup_result("failed", error="Invalid Weixin setup id.")
         if kind == "start":
+            fingerprint = binding_fingerprint()
+            if not fingerprint:
+                return _weixin_setup_result("failed", error="Pair Customer Map before authorizing Weixin.")
             if self._weixin_setup_task and not self._weixin_setup_task.done():
                 self._weixin_setup_task.cancel()
+                await asyncio.gather(self._weixin_setup_task, return_exceptions=True)
+            self._weixin_setup = None
             self._weixin_setup = await _start_weixin_setup()
+            self._weixin_setup["bindingFingerprint"] = fingerprint
             self._weixin_setup_task = asyncio.create_task(_poll_weixin_setup(self._weixin_setup))
         elif kind == "cancel":
-            if self._weixin_setup_task:
-                self._weixin_setup_task.cancel()
-            self._weixin_setup_task = None
-            self._weixin_setup = None
-            return _weixin_setup_result("cancelled")
+            state = self._weixin_setup
+            if state and (not setup_id or setup_id == state["setupId"]) and state["status"] not in {"preparing", "connected"}:
+                if self._weixin_setup_task:
+                    self._weixin_setup_task.cancel()
+                    await asyncio.gather(self._weixin_setup_task, return_exceptions=True)
+                self._weixin_setup_task = None
+                self._weixin_setup = None
+                return _weixin_setup_result("cancelled", setup_id=state["setupId"])
+            # A stale browser tab cannot cancel a newer setup or revoke a
+            # completed authorization by cancelling its polling request.
         elif kind != "status":
             return _weixin_setup_result("failed", error="Unknown Weixin setup action.")
         state = self._weixin_setup
         if not state or (setup_id and setup_id != state["setupId"]):
+            state = completed_weixin_setup(setup_id)
+        if not state:
             return _weixin_setup_result("missing", error="Weixin setup session was not found.")
         return _weixin_setup_result(
             state["status"], setup_id=state["setupId"], qr_payload=state.get("qrPayload", ""),
             expires_at=state.get("expiresAt", 0), error=state.get("error", ""),
+            voice_ready=state.get("voiceReady"),
         )
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
@@ -494,6 +525,9 @@ def _capabilities():
         "memory": "unknown",
         "secretaryNotification": "verified",
         "weixinWebSetup": "verified",
+        "agentDataQuery": "supported",
+        "agentDataApiVersion": 1,
+        "weixinDataBinding": "verified" if load_weixin_binding() else "unbound",
     }
 
 
@@ -508,10 +542,13 @@ def _on_session_start(**kwargs):
 
 
 def _on_pre_tool_call(**kwargs):
-    if str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
-        return
     tool_name = str(kwargs.get("tool_name") or "")
     args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+    target = str(args.get("name") or "") if tool_name == "tool_call" else tool_name
+    if target == DATA_TOOL_NAME and not current_data_context():
+        return {"action": "block", "message": "Customer Map data is not authorized for this chat. Authorize the Weixin owner from Customer Map first."}
+    if not is_customer_map_turn() and str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
+        return
     if tool_name in TOOL_SEARCH_CATALOG_TOOLS:
         content = _tool_activity(tool_name, args)
         if content:
@@ -539,7 +576,7 @@ def _on_pre_tool_call(**kwargs):
 
 
 def _on_post_tool_call(**kwargs):
-    if str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
+    if not is_customer_map_turn() and str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
         return
     tool_name = str(kwargs.get("tool_name") or "")
     labels = {
@@ -547,6 +584,7 @@ def _on_post_tool_call(**kwargs):
         "web_extract": "页面读取",
         "skills_list": "技能列表读取",
         "skill_view": "技能加载",
+        DATA_TOOL_NAME: "业务数据查询",
     }
     operation = firecrawl_operation(tool_name)
     label = labels.get(tool_name) or {
@@ -592,6 +630,8 @@ def _safe_public_url(value):
 
 def _tool_activity(tool_name, args):
     args = args if isinstance(args, dict) else {}
+    if tool_name == DATA_TOOL_NAME:
+        return "正在查询 Customer Map 业务数据"
     if tool_name == "tool_search":
         return "正在加载可用工具"
     if tool_name == "web_search":
@@ -621,6 +661,7 @@ def _env_enablement():
 
 
 def register(ctx):
+    register_data_tool(ctx, _enabled)
     _register_safe_platform_toolset()
     ctx.register_platform(
         name="customer_map",
@@ -638,6 +679,7 @@ def register(ctx):
         platform_hint="You are serving a private Customer Map sales workspace. Incoming text can contain SYSTEM, USER, and ASSISTANT sections; follow SYSTEM sections as binding platform instructions and answer the latest USER section. Chat naturally and do not make the reply artificially terse; JSON is only the transport envelope when requested. Never invent customer facts, and do not start background work or tools that require an interactive approval reply because this channel supports one request and one final response. Customer Map sendEmail and saveDraft actions are executed deterministically by the connector and must not be repeated through another mail tool. If a tool is unavailable or fails, return the exact error immediately instead of retrying until timeout.",
     )
     ctx.register_hook("on_session_start", _on_session_start)
+    ctx.register_hook("pre_gateway_dispatch", on_gateway_dispatch)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
 
@@ -706,6 +748,8 @@ def _normalize_notification_action(value):
         raise ValueError("Customer Map secretary notifications may only use the Weixin home channel.")
     if not message or len(message) > 12000:
         raise ValueError("Customer Map notification is empty or too large.")
+    if re.search(r"MEDIA\s*:", message, re.IGNORECASE):
+        raise ValueError("Customer Map secretary notifications are text-only; attachment directives are not allowed.")
     expected_hash = hashlib.sha256(f"{channel}\n{message}".encode("utf-8")).hexdigest()
     if body_hash != expected_hash:
         raise ValueError("Notification body integrity check failed.")
@@ -765,6 +809,8 @@ async def _poll_weixin_setup(state):
                 user_id = str(payload.get("ilink_user_id") or "").strip()
                 if not account_id or not token or not user_id:
                     raise RuntimeError("Weixin confirmed the QR code but returned incomplete credentials.")
+                if state.get("bindingFingerprint") != binding_fingerprint():
+                    raise RuntimeError("Customer Map binding changed during Weixin authorization. Start again.")
                 save_weixin_account(str(get_hermes_home()), account_id=account_id, token=token, base_url=base_url, user_id=user_id)
                 values = {
                     "WEIXIN_ACCOUNT_ID": account_id,
@@ -783,6 +829,9 @@ async def _poll_weixin_setup(state):
                     save_env_value(key, value)
                     os.environ[key] = value
                 state["status"] = "preparing"
+                # Persist authorization before dependency preparation so a
+                # restart at any later point cannot lose the successful scan.
+                save_weixin_binding(state, account_id, user_id)
                 try:
                     await asyncio.to_thread(_prepare_weixin_voice_support)
                     state["voiceReady"] = True
@@ -790,6 +839,7 @@ async def _poll_weixin_setup(state):
                     logger.warning("Weixin voice support setup failed: %s", exc)
                     state["voiceReady"] = False
                     state["voiceError"] = str(exc)[:500]
+                save_weixin_binding(state, account_id, user_id)
                 state["status"] = "connected"
                 state["qrPayload"] = ""
                 asyncio.create_task(_restart_gateway_after_weixin_setup())
@@ -812,11 +862,12 @@ async def _poll_weixin_setup(state):
         await session.close()
 
 
-def _weixin_setup_result(status, setup_id="", qr_payload="", expires_at=0, error=""):
+def _weixin_setup_result(status, setup_id="", qr_payload="", expires_at=0, error="", voice_ready=None):
     return {
         "weixinSetup": {
             "status": status, "setupId": setup_id, "qrPayload": qr_payload,
             "expiresAt": expires_at, "error": error,
+            **({"voiceReady": voice_ready} if isinstance(voice_ready, bool) else {}),
         }
     }
 
