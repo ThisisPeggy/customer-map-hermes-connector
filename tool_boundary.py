@@ -7,7 +7,7 @@ from pathlib import Path
 
 SAFE_TOOLSET_NAME = "customer-map-readonly"
 PLATFORM_DEFAULT_TOOLSET_NAME = "hermes-customer_map"
-SAFE_PLATFORM_TOOLSETS = [SAFE_TOOLSET_NAME, "customer-map-data", "no_mcp"]
+SAFE_PLATFORM_TOOLSETS = [SAFE_TOOLSET_NAME, "customer-map-data", "web", "no_mcp"]
 # Hermes reverse-maps the complete built-in web subset from this composite.
 ALLOWED_EFFECTIVE_TOOLSETS = {SAFE_TOOLSET_NAME, "customer-map-data", "web"}
 BASE_ALLOWED_EFFECTIVE_TOOLS = {
@@ -85,6 +85,11 @@ def ensure_customer_map_tool_boundary():
     if not isinstance(platform_toolsets, dict):
         platform_toolsets = {}
         config["platform_toolsets"] = platform_toolsets
+    # Keep ``web`` explicit even though ``customer-map-readonly`` contains the
+    # same built-in web tools. Hermes 0.21.2 treats a list made only of custom
+    # composite names as implicit and reverse-maps it; with xAI credentials
+    # present that path also enables ``x_search``. Naming the built-in web
+    # toolset makes this an explicit allowlist and prevents that injection.
     platform_toolsets["customer_map"] = list(SAFE_PLATFORM_TOOLSETS)
 
     # Hermes defaults newly discovered plugin toolsets to enabled. Mark every

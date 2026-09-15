@@ -855,6 +855,8 @@ def _check_env_write():
             config_text = (Path(directory) / "config.yaml").read_text(encoding="utf-8")
             assert "customer_map:" in config_text
             assert "- customer-map-readonly" in config_text
+            assert "- customer-map-data" in config_text
+            assert "- web" in config_text
             assert "- no_mcp" in config_text
         finally:
             if previous is None:
