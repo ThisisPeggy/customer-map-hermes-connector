@@ -193,7 +193,7 @@ class SecretaryTests(unittest.TestCase):
             request = build.return_value.open.call_args.args[0]
             self.assertEqual(request.full_url, "https://customer-map.test/api/agent-data")
             self.assertEqual(request.get_header("Authorization"), "Bearer secret-test-bridge-token")
-            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.7.1")
+            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.7.2")
             self.assertEqual(json.loads(request.data), {"runtime": "hermes", "query": {"operation": "work_summary", "period": "today"}})
             self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 25)
             self.assertIsInstance(build.call_args.args[0], agent_data._NoRedirect)

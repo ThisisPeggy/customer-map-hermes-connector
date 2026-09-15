@@ -82,7 +82,7 @@ def customer_map_query(args, **_kwargs):
             "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json",
             # Cloudflare rejects urllib's generic Python user agent before the
             # Customer Map function can validate the delegated bridge token.
-            "User-Agent": "Customer-Map-Hermes/0.7.1",
+            "User-Agent": "Customer-Map-Hermes/0.7.2",
         })
         # In particular, never forward the bridge credential to a redirected host.
         opener = urllib.request.build_opener(_NoRedirect())
