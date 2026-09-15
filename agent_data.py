@@ -80,6 +80,9 @@ def customer_map_query(args, **_kwargs):
             return _failure("invalid_query", "Customer Map query is too large.")
         request = urllib.request.Request(endpoint, data=body, method="POST", headers={
             "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json",
+            # Cloudflare rejects urllib's generic Python user agent before the
+            # Customer Map function can validate the delegated bridge token.
+            "User-Agent": "Customer-Map-Hermes/0.7.1",
         })
         # In particular, never forward the bridge credential to a redirected host.
         opener = urllib.request.build_opener(_NoRedirect())
