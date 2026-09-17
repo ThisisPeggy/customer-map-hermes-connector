@@ -82,7 +82,8 @@ class SecretaryTests(unittest.TestCase):
         self.assertNotIn("secret-test-bridge-token", saved)
         self.assertNotIn("secret-test-weixin-token", saved)
         self.assertNotIn("qrPayload", saved)
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         async def check():
             adapter = self.adapter_module.CustomerMapAdapter({})
             result = await adapter._run_weixin_setup_action({"version": 1, "action": "status", "setupId": "a" * 32})
@@ -193,7 +194,7 @@ class SecretaryTests(unittest.TestCase):
             request = build.return_value.open.call_args.args[0]
             self.assertEqual(request.full_url, "https://customer-map.test/api/agent-data")
             self.assertEqual(request.get_header("Authorization"), "Bearer secret-test-bridge-token")
-            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.7.2")
+            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.8.0")
             self.assertEqual(json.loads(request.data), {"runtime": "hermes", "query": {"operation": "work_summary", "period": "today"}})
             self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 25)
             self.assertIsInstance(build.call_args.args[0], agent_data._NoRedirect)
@@ -317,7 +318,7 @@ class SecretaryTests(unittest.TestCase):
             message = "今日已发送 3 封邮件。"
             action = {"version": 1, "actionId": "d" * 32, "channel": "weixin", "message": message,
                       "bodyHash": self.adapter_module.hashlib.sha256(f"weixin\n{message}".encode()).hexdigest()}
-            with patch.object(sys.modules["tools.send_message_tool"], "send_message_tool", return_value={"success": True, "message_id": "test-id"}) as send:
+            with patch.object(self.adapter_module, "_send_weixin_notification", new_callable=AsyncMock, return_value={"success": True, "message_id": "test-id"}) as send:
                 unbound = await adapter._run_notification_action(action)
                 self.assertEqual(unbound["notificationReceipt"]["status"], "failed")
                 send.assert_not_called()
@@ -325,7 +326,7 @@ class SecretaryTests(unittest.TestCase):
                 first = await adapter._run_notification_action(action)
                 again = await adapter._run_notification_action(action)
                 self.assertEqual(first, again)
-                self.assertEqual(send.call_args.args[0]["target"], "weixin:weixin-owner")
+                self.assertEqual(send.call_args.args, ("weixin-owner", message, None))
                 send.assert_called_once()
                 # A receipt for one CM binding cannot become another's receipt.
                 with patch.dict(os.environ, {"CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "new-test-binding"}):
@@ -334,6 +335,44 @@ class SecretaryTests(unittest.TestCase):
                     self.assertEqual(send.call_count, 2)
 
         asyncio.run(check())
+
+    def test_notification_send_reuses_weixin_on_the_current_gateway_loop(self):
+        async def check():
+            direct = AsyncMock(return_value={"success": True, "message_id": "native-id"})
+            with patch.object(sys.modules["gateway.platforms.weixin"], "send_weixin_direct", direct):
+                result = await self.adapter_module._send_weixin_notification("weixin-owner", "测试通知")
+            self.assertTrue(result["success"])
+            direct.assert_awaited_once_with(
+                extra={
+                    "account_id": "weixin-bot",
+                    "base_url": "",
+                    "cdn_base_url": "",
+                },
+                token="secret-test-weixin-token",
+                chat_id="weixin-owner",
+                message="测试通知",
+                media_files=None,
+            )
+
+        asyncio.run(check())
+
+    def test_notification_image_is_verified_and_sent_as_png(self):
+        image_bytes = b"verified-png-content"
+        image_hash = __import__("hashlib").sha256(image_bytes).hexdigest()
+        message = "热门货币趋势见附图。"
+        body_hash = __import__("hashlib").sha256(f"weixin\n{message}\n{image_hash}".encode()).hexdigest()
+        action = self.adapter_module._normalize_notification_action({
+            "version": 2, "actionId": "e" * 32, "channel": "weixin", "message": message,
+            "bodyHash": body_hash, "image": {
+                "mimeType": "image/png", "fileName": "rates.png",
+                "dataBase64": __import__("base64").b64encode(image_bytes).decode(), "sha256": image_hash,
+            },
+        })
+        self.assertEqual(action["image"]["bytes"], image_bytes)
+        with self.assertRaisesRegex(ValueError, "integrity"):
+            self.adapter_module._normalize_notification_action({
+                **action, "image": {"mimeType": "image/png", "dataBase64": "YQ==", "sha256": image_hash},
+            })
 
     def test_text_briefings_cannot_turn_business_fields_into_local_file_attachments(self):
         message = "Company: MEDIA:/private/customer-file"

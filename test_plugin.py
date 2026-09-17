@@ -24,6 +24,7 @@ def _load_adapter():
     config = types.ModuleType("gateway.config")
     platforms = types.ModuleType("gateway.platforms")
     base = types.ModuleType("gateway.platforms.base")
+    weixin = types.ModuleType("gateway.platforms.weixin")
     gateway_run = types.ModuleType("gateway.run")
     gateway_session = types.ModuleType("gateway.session")
     hermes_cli = types.ModuleType("hermes_cli")
@@ -32,6 +33,9 @@ def _load_adapter():
     tools_registry = types.ModuleType("tools.registry")
     tools_send_message = types.ModuleType("tools.send_message_tool")
     tools_send_message.send_message_tool = lambda args: json.dumps({"success": True, "message_id": "wx-test"})
+    async def send_weixin_direct(**_kwargs):
+        return {"success": True, "message_id": "wx-test"}
+    weixin.send_weixin_direct = send_weixin_direct
     toolsets = types.ModuleType("toolsets")
     toolsets.TOOLSETS = {}
     toolsets.resolve_toolset = lambda name: list(toolsets.TOOLSETS.get(name, {}).get("tools", []))
@@ -91,6 +95,7 @@ def _load_adapter():
         "gateway.config": config,
         "gateway.platforms": platforms,
         "gateway.platforms.base": base,
+        "gateway.platforms.weixin": weixin,
         "gateway.run": gateway_run,
         "gateway.session": gateway_session,
         "hermes_cli": hermes_cli,

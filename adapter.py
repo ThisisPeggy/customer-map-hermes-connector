@@ -1,6 +1,7 @@
 """Hermes platform plugin for Customer Map's outbound WebSocket relay."""
 
 import asyncio
+import base64
 import hashlib
 import importlib
 import ipaddress
@@ -36,7 +37,7 @@ except ImportError:
     from weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.7.2"
+PLUGIN_VERSION = "0.8.0"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 NOTIFICATION_CACHE_LIMIT = 500
@@ -342,11 +343,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
                     return _notification_action_result(action, "failed", error="Notification action id was reused with different content.")
                 return cached["result"]
             try:
-                from tools.send_message_tool import send_message_tool
-                raw = await asyncio.to_thread(send_message_tool, {
-                    "action": "send", "target": f"weixin:{binding['userId']}", "message": action["message"],
-                })
-                delivered = json.loads(raw) if isinstance(raw, str) else raw
+                delivered = await _send_weixin_notification(binding["userId"], action["message"], action.get("image"))
                 if not isinstance(delivered, dict) or delivered.get("success") is not True:
                     raise RuntimeError(str((delivered or {}).get("error") if isinstance(delivered, dict) else delivered) or "Weixin delivery failed.")
                 result = _notification_action_result(action, "succeeded", message_id=str(delivered.get("message_id") or ""))
@@ -736,7 +733,7 @@ def _normalize_mail_action(value):
 
 
 def _normalize_notification_action(value):
-    if not isinstance(value, dict) or value.get("version") != 1:
+    if not isinstance(value, dict) or value.get("version") not in {1, 2}:
         raise ValueError("Unsupported Customer Map notification version.")
     action_id = str(value.get("actionId") or "").strip().lower()
     channel = str(value.get("channel") or "").strip().lower()
@@ -750,10 +747,56 @@ def _normalize_notification_action(value):
         raise ValueError("Customer Map notification is empty or too large.")
     if re.search(r"MEDIA\s*:", message, re.IGNORECASE):
         raise ValueError("Customer Map secretary notifications are text-only; attachment directives are not allowed.")
-    expected_hash = hashlib.sha256(f"{channel}\n{message}".encode("utf-8")).hexdigest()
+    image = None
+    if value.get("version") == 2:
+        source = value.get("image")
+        if not isinstance(source, dict) or source.get("mimeType") != "image/png":
+            raise ValueError("Customer Map notification image must be a PNG.")
+        data_base64 = str(source.get("dataBase64") or "")
+        image_hash = str(source.get("sha256") or "").lower()
+        try:
+            image_bytes = base64.b64decode(data_base64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Customer Map notification image is invalid.") from exc
+        if not image_bytes or len(image_bytes) > 5_000_000 or hashlib.sha256(image_bytes).hexdigest() != image_hash:
+            raise ValueError("Customer Map notification image integrity check failed.")
+        image = {"bytes": image_bytes, "sha256": image_hash}
+    expected_hash = hashlib.sha256(
+        (f"{channel}\n{message}\n{image['sha256']}" if image else f"{channel}\n{message}").encode("utf-8")
+    ).hexdigest()
     if body_hash != expected_hash:
         raise ValueError("Notification body integrity check failed.")
-    return {"version": 1, "actionId": action_id, "channel": channel, "message": message, "bodyHash": body_hash}
+    return {"version": value.get("version"), "actionId": action_id, "channel": channel, "message": message, "bodyHash": body_hash, **({"image": image} if image else {})}
+
+
+async def _send_weixin_notification(user_id, message, image=None):
+    """Send on the gateway loop so the live Weixin adapter and its context token can be reused."""
+    from gateway.platforms.weixin import send_weixin_direct
+
+    path = None
+    try:
+        if image:
+            handle = tempfile.NamedTemporaryFile(prefix="customer-map-notification-", suffix=".png", delete=False)
+            path = handle.name
+            with handle:
+                handle.write(image["bytes"])
+        return await send_weixin_direct(
+            extra={
+                "account_id": os.getenv("WEIXIN_ACCOUNT_ID", ""),
+                "base_url": os.getenv("WEIXIN_BASE_URL", ""),
+                "cdn_base_url": os.getenv("WEIXIN_CDN_BASE_URL", ""),
+            },
+            token=os.getenv("WEIXIN_TOKEN", ""),
+            chat_id=user_id,
+            message=message,
+            media_files=[(path, False)] if path else None,
+        )
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 async def _start_weixin_setup():
