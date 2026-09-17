@@ -15,11 +15,11 @@ except ImportError:
 
 DATA_TOOLSET = "customer-map-data"
 TOOL_NAME = "customer_map_query"
-OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "quotes", "follow_ups", "mail_activity")
+OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "quotes", "follow_ups", "mail_activity", "exchange_rate_chart")
 MAX_RESPONSE_BYTES = 512_000
 QUERY_SCHEMA = {
     "name": TOOL_NAME,
-    "description": "Read the bound user's Customer Map cloud records. Use work_summary for exact activity counts, customers to resolve company names to IDs, and the other operations for paginated details. Honor period, metric definitions, and source coverage; unavailable is not zero. Read-only: cannot send mail, create inquiries, or schedule tasks.",
+    "description": "Read the bound user's Customer Map cloud records. Use work_summary for exact activity counts, customers to resolve company names to IDs, and exchange_rate_chart when the owner asks to generate and send the current exchange-rate chart to Weixin. Honor period, metric definitions, and source coverage; unavailable is not zero.",
     "parameters": {
         "type": "object", "additionalProperties": False, "required": ["operation"],
         "properties": {
