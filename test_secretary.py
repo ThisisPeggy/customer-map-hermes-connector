@@ -326,7 +326,7 @@ class SecretaryTests(unittest.TestCase):
                 first = await adapter._run_notification_action(action)
                 again = await adapter._run_notification_action(action)
                 self.assertEqual(first, again)
-                self.assertEqual(send.call_args.args, ("weixin-owner", message, None))
+                self.assertEqual(send.call_args.args, ("weixin-owner", message))
                 send.assert_called_once()
                 # A receipt for one CM binding cannot become another's receipt.
                 with patch.dict(os.environ, {"CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "new-test-binding"}):
@@ -356,22 +356,13 @@ class SecretaryTests(unittest.TestCase):
 
         asyncio.run(check())
 
-    def test_notification_image_is_verified_and_sent_as_png(self):
-        image_bytes = b"verified-png-content"
-        image_hash = __import__("hashlib").sha256(image_bytes).hexdigest()
+    def test_notification_rejects_legacy_image_payloads(self):
         message = "热门货币趋势见附图。"
-        body_hash = __import__("hashlib").sha256(f"weixin\n{message}\n{image_hash}".encode()).hexdigest()
-        action = self.adapter_module._normalize_notification_action({
-            "version": 2, "actionId": "e" * 32, "channel": "weixin", "message": message,
-            "bodyHash": body_hash, "image": {
-                "mimeType": "image/png", "fileName": "rates.png",
-                "dataBase64": __import__("base64").b64encode(image_bytes).decode(), "sha256": image_hash,
-            },
-        })
-        self.assertEqual(action["image"]["bytes"], image_bytes)
-        with self.assertRaisesRegex(ValueError, "integrity"):
+        body_hash = __import__("hashlib").sha256(f"weixin\n{message}".encode()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
             self.adapter_module._normalize_notification_action({
-                **action, "image": {"mimeType": "image/png", "dataBase64": "YQ==", "sha256": image_hash},
+                "version": 2, "actionId": "e" * 32, "channel": "weixin", "message": message,
+                "bodyHash": body_hash, "image": {"mimeType": "image/png", "dataBase64": "YQ=="},
             })
 
     def test_text_briefings_cannot_turn_business_fields_into_local_file_attachments(self):

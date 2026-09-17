@@ -6,6 +6,8 @@ Version 0.7.0 adds the `customer_map_query` tool for live, read-only business qu
 
 Successful QR authorization is saved before voice preparation and survives gateway restarts. The record is tied to the current Customer Map site, connection credential, Weixin bot, and scanning user, and contains no raw tokens or QR payload. Changing the Customer Map binding does not authorize an old Weixin recipient to read the new account. Notifications require the same binding, target that exact recipient, and deduplicate successful delivery per binding and action ID. Their text-only protocol rejects local attachment directives.
 
+Version 0.8.1 accepts only text notification payloads. Customer Map sends scheduled exchange-rate updates as Markdown tables; the Connector never receives, stores, or uploads an image attachment for these messages.
+
 The plugin retains SILK decoder and local speech-to-text preparation during QR setup, followed by an automatic gateway restart. Direct messages are restricted to the scanning user. Ordinary Customer Map turns retain a fail-closed, read-only allowlist, including on restored sessions: business queries, built-in web search/extraction, and installed skill loading. A configured Firecrawl MCP server contributes only `firecrawl_search` and non-interactive, public-URL `firecrawl_scrape`. The scoped `tool_search`, `tool_describe`, and `tool_call` bridge cannot bypass these checks. Terminal, files, code execution, delegation, kanban, cron, arbitrary MCP, memory writes, raw session search, and model-driven mail remain unavailable on the Customer Map platform. Native tools on unrelated Hermes platforms are not reconfigured.
 
 ## Business query API
