@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -24,19 +25,21 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 
 try:
     from .agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
+    from .operations import TOOL_NAME as ACTION_TOOL_NAME, register_action_tool
     from .mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from .secretary_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from .tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
     from .weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 except ImportError:
     from agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
+    from operations import TOOL_NAME as ACTION_TOOL_NAME, register_action_tool
     from mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from secretary_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
     from weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.8.1"
+PLUGIN_VERSION = "0.9.0"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 NOTIFICATION_CACHE_LIMIT = 500
@@ -341,13 +344,23 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 if cached["bodyHash"] != action["bodyHash"]:
                     return _notification_action_result(action, "failed", error="Notification action id was reused with different content.")
                 return cached["result"]
+            temporary_directory = ""
             try:
-                delivered = await _send_weixin_notification(binding["userId"], action["message"])
+                media_files = None
+                if action.get("attachment"):
+                    temporary_directory, attachment_path = await _download_notification_attachment(
+                        self._http, self.site, self.bridge_token, action["attachment"],
+                    )
+                    media_files = [(attachment_path, False)]
+                delivered = await _send_weixin_notification(binding["userId"], action["message"], media_files)
                 if not isinstance(delivered, dict) or delivered.get("success") is not True:
                     raise RuntimeError(str((delivered or {}).get("error") if isinstance(delivered, dict) else delivered) or "Weixin delivery failed.")
                 result = _notification_action_result(action, "succeeded", message_id=str(delivered.get("message_id") or ""))
             except Exception as exc:
                 result = _notification_action_result(action, "failed", error=str(exc))
+            finally:
+                if temporary_directory:
+                    shutil.rmtree(temporary_directory, ignore_errors=True)
             if result["notificationReceipt"]["status"] == "succeeded":
                 self._notification_results[cache_id] = {"bodyHash": action["bodyHash"], "result": result}
                 while len(self._notification_results) > NOTIFICATION_CACHE_LIMIT:
@@ -628,6 +641,9 @@ def _tool_activity(tool_name, args):
     args = args if isinstance(args, dict) else {}
     if tool_name == DATA_TOOL_NAME:
         return "正在查询 Customer Map 业务数据"
+    if tool_name == ACTION_TOOL_NAME:
+        kind = str(args.get("kind") or "").strip().lower()
+        return "正在执行已确认的 Customer Map 操作" if kind == "confirm" else "正在准备 Customer Map 操作确认"
     if tool_name == "tool_search":
         return "正在加载可用工具"
     if tool_name == "web_search":
@@ -658,6 +674,7 @@ def _env_enablement():
 
 def register(ctx):
     register_data_tool(ctx, _enabled)
+    register_action_tool(ctx, _enabled)
     _register_safe_platform_toolset()
     ctx.register_platform(
         name="customer_map",
@@ -732,7 +749,7 @@ def _normalize_mail_action(value):
 
 
 def _normalize_notification_action(value):
-    if not isinstance(value, dict) or value.get("version") != 1:
+    if not isinstance(value, dict) or value.get("version") not in (1, 2):
         raise ValueError("Unsupported Customer Map notification version.")
     action_id = str(value.get("actionId") or "").strip().lower()
     channel = str(value.get("channel") or "").strip().lower()
@@ -746,13 +763,78 @@ def _normalize_notification_action(value):
         raise ValueError("Customer Map notification is empty or too large.")
     if re.search(r"MEDIA\s*:", message, re.IGNORECASE):
         raise ValueError("Customer Map secretary notifications are text-only; attachment directives are not allowed.")
-    expected_hash = hashlib.sha256(f"{channel}\n{message}".encode("utf-8")).hexdigest()
+    attachment = None
+    attachment_hash_part = ""
+    if value.get("version") == 2:
+        raw_attachment = value.get("attachment")
+        if not isinstance(raw_attachment, dict):
+            raise ValueError("Customer Map file notification is missing its attachment.")
+        url = str(raw_attachment.get("url") or "").strip()
+        filename = Path(str(raw_attachment.get("filename") or "")).name
+        mime_type = str(raw_attachment.get("mimeType") or "").strip().lower()
+        if not url or not filename or filename != str(raw_attachment.get("filename") or ""):
+            raise ValueError("Customer Map file attachment metadata is invalid.")
+        if not re.fullmatch(r"[A-Za-z0-9._ -]{1,120}", filename):
+            raise ValueError("Customer Map file name is invalid.")
+        if mime_type not in {"application/pdf", "text/csv", "text/plain", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}:
+            raise ValueError("Customer Map file type is not allowed.")
+        attachment = {"url": url, "filename": filename, "mimeType": mime_type}
+        attachment_hash_part = f"\n{url}\n{filename}\n{mime_type}"
+    elif value.get("attachment") is not None:
+        raise ValueError("Customer Map notification version does not support attachments.")
+    expected_hash = hashlib.sha256(f"{channel}\n{message}{attachment_hash_part}".encode("utf-8")).hexdigest()
     if body_hash != expected_hash:
         raise ValueError("Notification body integrity check failed.")
-    return {"version": value.get("version"), "actionId": action_id, "channel": channel, "message": message, "bodyHash": body_hash}
+    return {"version": value.get("version"), "actionId": action_id, "channel": channel, "message": message, "attachment": attachment, "bodyHash": body_hash}
 
 
-async def _send_weixin_notification(user_id, message):
+async def _download_notification_attachment(session, site, bridge_token, attachment):
+    from urllib.parse import urlparse
+
+    expected_origin = urlparse(site)
+    attachment_url = urlparse(attachment["url"])
+    if (attachment_url.scheme, attachment_url.netloc) != (expected_origin.scheme, expected_origin.netloc):
+        raise ValueError("Customer Map attachment URL does not match the paired site.")
+    if attachment_url.path != "/api/hermes-link" or attachment_url.username or attachment_url.password or attachment_url.fragment:
+        raise ValueError("Customer Map attachment URL is not allowed.")
+    own_session = session is None or session.closed
+    client = ClientSession(timeout=ClientTimeout(total=45)) if own_session else session
+    directory = tempfile.mkdtemp(prefix="customer-map-file-")
+    path = str(Path(directory) / attachment["filename"])
+    try:
+        async with client.get(
+            attachment["url"],
+            headers={"Authorization": f"Bearer {bridge_token}", "Accept": attachment["mimeType"]},
+            allow_redirects=False,
+            timeout=ClientTimeout(total=45),
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Customer Map file download failed with HTTP {response.status}.")
+            content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type != attachment["mimeType"]:
+                raise RuntimeError("Customer Map file type did not match its attachment metadata.")
+            declared = int(response.headers.get("Content-Length") or 0)
+            if declared < 0 or declared > 15_000_000:
+                raise RuntimeError("Customer Map file is too large for Weixin delivery.")
+            total = 0
+            with open(path, "wb") as handle:
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > 15_000_000:
+                        raise RuntimeError("Customer Map file is too large for Weixin delivery.")
+                    handle.write(chunk)
+            if total == 0:
+                raise RuntimeError("Customer Map returned an empty file.")
+        return directory, path
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    finally:
+        if own_session:
+            await client.close()
+
+
+async def _send_weixin_notification(user_id, message, media_files=None):
     """Send on the gateway loop so the live Weixin adapter and its context token can be reused."""
     from gateway.platforms.weixin import send_weixin_direct
 
@@ -765,7 +847,7 @@ async def _send_weixin_notification(user_id, message):
         token=os.getenv("WEIXIN_TOKEN", ""),
         chat_id=user_id,
         message=message,
-        media_files=None,
+        media_files=media_files,
     )
 
 

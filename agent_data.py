@@ -15,11 +15,11 @@ except ImportError:
 
 DATA_TOOLSET = "customer-map-data"
 TOOL_NAME = "customer_map_query"
-OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "quotes", "follow_ups", "mail_activity", "exchange_rate_chart")
+OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "product_lists", "quotes", "follow_ups", "mail_activity", "exchange_rate_chart")
 MAX_RESPONSE_BYTES = 512_000
 QUERY_SCHEMA = {
     "name": TOOL_NAME,
-    "description": "Read the bound user's Customer Map cloud records. Use work_summary for exact activity counts, customers to resolve company names to IDs, and exchange_rate_chart when the owner asks to generate and send the current exchange-rate chart to Weixin. Honor period, metric definitions, and source coverage; unavailable is not zero.",
+    "description": "Read the bound user's Customer Map cloud records. Use work_summary for exact activity counts, customers to resolve company names to IDs, product_lists to resolve products and pricing inputs, and exchange_rate_chart when the owner asks to generate and send the current exchange-rate chart to Weixin. Honor period, metric definitions, and source coverage; unavailable is not zero.",
     "parameters": {
         "type": "object", "additionalProperties": False, "required": ["operation"],
         "properties": {
@@ -32,6 +32,7 @@ QUERY_SCHEMA = {
             "country": {"type": "string", "maxLength": 100, "description": "Exact saved country value; customers only."},
             "customerId": {"type": "string", "maxLength": 160, "description": "Real ID from customers. Required for customer_detail; optional for work_summary, quotes, follow_ups, mail_activity."},
             "quoteId": {"type": "string", "maxLength": 160, "description": "Real quote ID; quotes (returns line items) or follow_ups only."},
+            "productListId": {"type": "string", "maxLength": 160, "description": "Real product list ID; product_lists returns up to 200 product rows when provided."},
             "relationshipStatus": {"type": "string", "enum": ["有回复", "有兴趣", "有询价", "成交过"], "description": "customers only: CURRENT relationship state, not reply/inquiry events during a period."},
             "mailKind": {"type": "string", "enum": ["sent", "reply", "bounce"], "description": "mail_activity only; defaults to sent."},
             "includeOverdue": {"type": "boolean", "description": "follow_ups only; defaults to true. False restricts to tasks due within the selected period."},
@@ -82,7 +83,7 @@ def customer_map_query(args, **_kwargs):
             "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json",
             # Cloudflare rejects urllib's generic Python user agent before the
             # Customer Map function can validate the delegated bridge token.
-            "User-Agent": "Customer-Map-Hermes/0.8.0",
+            "User-Agent": "Customer-Map-Hermes/0.9.0",
         })
         # In particular, never forward the bridge credential to a redirected host.
         opener = urllib.request.build_opener(_NoRedirect())

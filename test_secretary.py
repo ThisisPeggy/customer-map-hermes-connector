@@ -194,7 +194,7 @@ class SecretaryTests(unittest.TestCase):
             request = build.return_value.open.call_args.args[0]
             self.assertEqual(request.full_url, "https://customer-map.test/api/agent-data")
             self.assertEqual(request.get_header("Authorization"), "Bearer secret-test-bridge-token")
-            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.8.0")
+            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.9.0")
             self.assertEqual(json.loads(request.data), {"runtime": "hermes", "query": {"operation": "work_summary", "period": "today"}})
             self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 25)
             self.assertIsInstance(build.call_args.args[0], agent_data._NoRedirect)
@@ -307,8 +307,11 @@ class SecretaryTests(unittest.TestCase):
     def test_plugin_registers_query_and_dispatch_hook(self):
         ctx = Mock()
         self.adapter_module.register(ctx)
-        self.assertEqual(ctx.register_tool.call_args.kwargs["name"], "customer_map_query")
-        self.assertEqual(ctx.register_tool.call_args.kwargs["toolset"], "customer-map-data")
+        registered = {call.kwargs["name"]: call.kwargs["toolset"] for call in ctx.register_tool.call_args_list}
+        self.assertEqual(registered, {
+            "customer_map_query": "customer-map-data",
+            "customer_map_action": "customer-map-actions",
+        })
         hooks = {call.args[0] for call in ctx.register_hook.call_args_list}
         self.assertIn("pre_gateway_dispatch", hooks)
 
@@ -326,7 +329,7 @@ class SecretaryTests(unittest.TestCase):
                 first = await adapter._run_notification_action(action)
                 again = await adapter._run_notification_action(action)
                 self.assertEqual(first, again)
-                self.assertEqual(send.call_args.args, ("weixin-owner", message))
+                self.assertEqual(send.call_args.args, ("weixin-owner", message, None))
                 send.assert_called_once()
                 # A receipt for one CM binding cannot become another's receipt.
                 with patch.dict(os.environ, {"CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "new-test-binding"}):
@@ -359,7 +362,7 @@ class SecretaryTests(unittest.TestCase):
     def test_notification_rejects_legacy_image_payloads(self):
         message = "热门货币趋势见附图。"
         body_hash = __import__("hashlib").sha256(f"weixin\n{message}".encode()).hexdigest()
-        with self.assertRaisesRegex(ValueError, "Unsupported"):
+        with self.assertRaisesRegex(ValueError, "missing its attachment"):
             self.adapter_module._normalize_notification_action({
                 "version": 2, "actionId": "e" * 32, "channel": "weixin", "message": message,
                 "bodyHash": body_hash, "image": {"mimeType": "image/png", "dataBase64": "YQ=="},

@@ -144,6 +144,56 @@ async def _check_secretary_notification_delivery():
                 os.environ["HERMES_HOME"] = previous_home
 
 
+async def _check_secretary_file_delivery():
+    module = _load_adapter()
+    observed = {}
+
+    async def file_handler(request):
+        assert request.headers.get("Authorization") == "Bearer test-token"
+        return web.Response(body=b"%PDF-1.7\nCustomer Map", content_type="application/pdf")
+
+    app = web.Application()
+    app.router.add_get("/api/hermes-link", file_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+
+    async def capture_delivery(user_id, message, media_files=None):
+        observed.update(user_id=user_id, message=message, media_files=media_files)
+        assert media_files and Path(media_files[0][0]).read_bytes().startswith(b"%PDF")
+        assert Path(media_files[0][0]).name == "QT-001.pdf"
+        return {"success": True, "message_id": "wx-file-test"}
+
+    with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {
+        "HERMES_HOME": home,
+        "CUSTOMER_MAP_HERMES_SITE": f"http://127.0.0.1:{port}",
+        "CUSTOMER_MAP_HERMES_CONNECTION_ID": "test-connection",
+        "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "test-token",
+        "WEIXIN_ACCOUNT_ID": "wxid_bot", "WEIXIN_TOKEN": "weixin-test-token",
+        "WEIXIN_HOME_CHANNEL": "wxid_owner",
+    }):
+        try:
+            module.save_weixin_binding({"setupId": "b" * 32, "bindingFingerprint": module.binding_fingerprint()}, "wxid_bot", "wxid_owner")
+            adapter = module.CustomerMapAdapter({})
+            message = "报价单文件"
+            attachment = {
+                "url": f"http://127.0.0.1:{port}/api/hermes-link?file=quote&quoteId={'c' * 36}",
+                "filename": "QT-001.pdf", "mimeType": "application/pdf",
+            }
+            hash_part = f"\n{attachment['url']}\n{attachment['filename']}\n{attachment['mimeType']}"
+            body_hash = __import__("hashlib").sha256(f"weixin\n{message}{hash_part}".encode()).hexdigest()
+            action = {"version": 2, "actionId": "d" * 32, "channel": "weixin", "message": message, "attachment": attachment, "bodyHash": body_hash}
+            with patch.object(module, "_send_weixin_notification", capture_delivery):
+                result = await adapter._run_notification_action(action)
+            assert result["notificationReceipt"]["status"] == "succeeded", result
+            assert observed["user_id"] == "wxid_owner"
+            assert not Path(observed["media_files"][0][0]).exists()
+        finally:
+            await runner.cleanup()
+
+
 async def _check_weixin_web_setup_protocol():
     module = _load_adapter()
     adapter = module.CustomerMapAdapter({})
@@ -861,6 +911,7 @@ def _check_env_write():
             assert "customer_map:" in config_text
             assert "- customer-map-readonly" in config_text
             assert "- customer-map-data" in config_text
+            assert "- customer-map-actions" in config_text
             assert "- web" in config_text
             assert "- no_mcp" in config_text
         finally:
@@ -875,6 +926,7 @@ def _check_safe_platform_composite():
     module._register_safe_platform_toolset()
     definition = sys.modules["toolsets"].TOOLSETS["customer-map-readonly"]
     assert definition["tools"] == [
+        "customer_map_action",
         "customer_map_query",
         "mcp__my_firecrawl__firecrawl_scrape", "mcp__my_firecrawl__firecrawl_search",
         "skill_view", "skills_list", "web_extract", "web_search",
@@ -904,6 +956,7 @@ def run_checks():
     asyncio.run(_check_mail_backend_auto_detection())
     asyncio.run(_check_persistent_mail_action_idempotency())
     asyncio.run(_check_secretary_notification_delivery())
+    asyncio.run(_check_secretary_file_delivery())
     asyncio.run(_check_weixin_web_setup_protocol())
     asyncio.run(_check_conversational_tool_boundary_fails_closed())
     asyncio.run(_check_rejects_stdin_body())

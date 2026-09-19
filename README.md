@@ -4,11 +4,11 @@ This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map t
 
 Version 0.7.0 adds the `customer_map_query` tool for live, read-only business queries from the Customer Map workspace and its authorized Weixin owner chat. Every owner-chat turn receives secretary instructions: understand text or a voice transcript as the user's request, query real records when needed, and answer directly. Translation is performed only when requested. Native Hermes still handles speech recognition and Weixin delivery; this plugin does not promise native outbound voice bubbles.
 
-Successful QR authorization is saved before voice preparation and survives gateway restarts. The record is tied to the current Customer Map site, connection credential, Weixin bot, and scanning user, and contains no raw tokens or QR payload. Changing the Customer Map binding does not authorize an old Weixin recipient to read the new account. Notifications require the same binding, target that exact recipient, and deduplicate successful delivery per binding and action ID. Their text-only protocol rejects local attachment directives.
+Successful QR authorization is saved before voice preparation and survives gateway restarts. The record is tied to the current Customer Map site, connection credential, Weixin bot, and scanning user, and contains no raw tokens or QR payload. Changing the Customer Map binding does not authorize an old Weixin recipient to read the new account. Notifications require the same binding, target that exact recipient, and deduplicate successful delivery per binding and action ID. Model-authored local attachment directives remain rejected.
 
-Version 0.8.1 accepts only text notification payloads. Customer Map sends scheduled exchange-rate updates as Markdown tables; the Connector never receives, stores, or uploads an image attachment for these messages.
+Version 0.9.0 accepts integrity-bound file notifications from the paired Customer Map origin. Files are downloaded with the Connector binding token into a private temporary directory, delivered to the bound Weixin owner, and deleted immediately afterward. Arbitrary URLs, redirects, unsupported file types, and files larger than 15 MB are rejected. The Connector does not send voice replies.
 
-The plugin retains SILK decoder and local speech-to-text preparation during QR setup, followed by an automatic gateway restart. Direct messages are restricted to the scanning user. Ordinary Customer Map turns retain a fail-closed, read-only allowlist, including on restored sessions: business queries, built-in web search/extraction, and installed skill loading. A configured Firecrawl MCP server contributes only `firecrawl_search` and non-interactive, public-URL `firecrawl_scrape`. The scoped `tool_search`, `tool_describe`, and `tool_call` bridge cannot bypass these checks. Terminal, files, code execution, delegation, kanban, cron, arbitrary MCP, memory writes, raw session search, and model-driven mail remain unavailable on the Customer Map platform. Native tools on unrelated Hermes platforms are not reconfigured.
+The plugin retains SILK decoder and local speech-to-text preparation during QR setup, followed by an automatic gateway restart. Direct messages are restricted to the scanning user. Ordinary Customer Map turns retain a fail-closed allowlist, including on restored sessions: read-only business queries, confirmation-gated Customer Map actions, built-in web search/extraction, and installed skill loading. The action tool can stage customers, products, quotations, PIs, Task Assistant campaigns, email replies, and quote-file delivery; the server, not the model, validates and executes them after explicit confirmation. A configured Firecrawl MCP server contributes only `firecrawl_search` and non-interactive, public-URL `firecrawl_scrape`. The scoped `tool_search`, `tool_describe`, and `tool_call` bridge cannot bypass these checks. Terminal, arbitrary local files, code execution, delegation, kanban, cron, arbitrary MCP, memory writes, raw session search, and unconfirmed model-driven mail remain unavailable on the Customer Map platform. Native tools on unrelated Hermes platforms are not reconfigured.
 
 ## Business query API
 
@@ -20,6 +20,7 @@ Deploy Customer Map's matching `/api/agent-data` implementation before using 0.7
 | `work_summary` | Exact new-customer, sent-mail, detected-reply, bounce, created-quote and completed-follow-up counts |
 | `customers` | Company/country/current-status filters, IDs and pagination |
 | `customer_detail` | One customer's business information |
+| `product_lists` | Product-list pricing settings and, for one list ID, bounded product rows |
 | `quotes` | Quotes for a customer; a quote ID includes line items |
 | `follow_ups` | Scheduled customer and quote tasks, due dates and overdue filtering |
 | `mail_activity` | Sent, detected-reply or recorded-bounce events |
@@ -30,7 +31,7 @@ The tool checks both per-dispatch routing and Hermes' concurrent session context
 
 ## Upgrading from 0.6.x
 
-After updating the website and plugin, restart the intended Hermes profile, then use **Authorize again / 重新扫码授权** in Customer Map's WeChat secretary settings once. Old home-channel settings alone do not prove which Customer Map account authorized them. No new Customer Map pairing is needed if the existing bridge binding is unchanged. If `customer-map-data` was explicitly disabled in Hermes' Weixin tool settings, enable it there.
+Update with `hermes plugins update customer-map-platform --enable`, then restart the intended Hermes profile. `--enable` means the updated plugin remains enabled immediately; the user does not need to enable it again. Use **Authorize again / 重新扫码授权** in Customer Map's WeChat secretary settings once when upgrading an old 0.6.x authorization. No new Customer Map pairing is needed if the existing bridge binding is unchanged. An administrator's separate, explicit toolset-deny policy still takes precedence.
 
 WeChat's authorization page currently calls this iLink connection **OpenClaw** (`bot_type=3` in the native QR request). Hermes still handles the conversation. That name is supplied by WeChat, not this plugin's label. When WeChat displays a replacement warning, confirming the new connection disconnects the previously linked assistant for that WeChat account.
 
@@ -56,11 +57,18 @@ Install the plugin with Hermes, use the one-time pairing command shown by Custom
 hermes plugins install https://github.com/ThisisPeggy/customer-map-hermes-connector --enable
 ```
 
+For later releases, update without losing the enabled state:
+
+```bash
+hermes plugins update customer-map-platform --enable
+hermes gateway restart
+```
+
 During local development:
 
 ```bash
 mkdir -p ~/.hermes/plugins/customer-map-platform
-cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py agent_data.py secretary_context.py weixin_binding.py ~/.hermes/plugins/customer-map-platform/
+cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py agent_data.py operations.py secretary_context.py weixin_binding.py ~/.hermes/plugins/customer-map-platform/
 python3 ~/.hermes/plugins/customer-map-platform/connect.py --site https://your-customer-map.example --code CMAP-HERMES-...
 hermes gateway restart
 ```
