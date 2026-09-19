@@ -375,6 +375,25 @@ class SecretaryTests(unittest.TestCase):
 
         asyncio.run(check())
 
+    def test_file_delivery_retries_once_without_the_stale_weixin_context_token(self):
+        async def check():
+            calls = []
+
+            async def direct(**kwargs):
+                calls.append(kwargs)
+                return {"success": len(calls) == 2, "message_id": "retry-id" if len(calls) == 2 else "", "error": "session timeout"}
+
+            with patch.object(sys.modules["gateway.platforms.weixin"], "send_weixin_direct", direct):
+                result = await self.adapter_module._send_weixin_notification(
+                    "weixin-owner", "Customer Map 报价已生成。", [("/tmp/KA-QT-2609-0008.pdf", False)],
+                )
+            self.assertTrue(result["success"])
+            self.assertEqual(calls[0]["message"], "Customer Map 报价已生成。")
+            self.assertEqual(calls[1]["message"], "")
+            self.assertEqual(calls[0]["media_files"], calls[1]["media_files"])
+
+        asyncio.run(check())
+
     def test_notification_rejects_legacy_image_payloads(self):
         message = "热门货币趋势见附图。"
         body_hash = __import__("hashlib").sha256(f"weixin\n{message}".encode()).hexdigest()

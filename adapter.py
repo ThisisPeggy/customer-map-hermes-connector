@@ -842,19 +842,46 @@ async def _download_notification_attachment(session, site, bridge_token, attachm
 
 async def _send_weixin_notification(user_id, message, media_files=None):
     """Send on the gateway loop so the live Weixin adapter and its context token can be reused."""
-    from gateway.platforms.weixin import send_weixin_direct
+    from gateway.platforms import weixin
 
-    return await send_weixin_direct(
-        extra={
-            "account_id": os.getenv("WEIXIN_ACCOUNT_ID", ""),
-            "base_url": os.getenv("WEIXIN_BASE_URL", ""),
-            "cdn_base_url": os.getenv("WEIXIN_CDN_BASE_URL", ""),
-        },
-        token=os.getenv("WEIXIN_TOKEN", ""),
+    extra = {
+        "account_id": os.getenv("WEIXIN_ACCOUNT_ID", ""),
+        "base_url": os.getenv("WEIXIN_BASE_URL", ""),
+        "cdn_base_url": os.getenv("WEIXIN_CDN_BASE_URL", ""),
+    }
+    token = os.getenv("WEIXIN_TOKEN", "")
+    delivered = await weixin.send_weixin_direct(
+        extra=extra,
+        token=token,
         chat_id=user_id,
         message=message,
         media_files=media_files,
     )
+    # Hermes' native Weixin adapter retries expired context tokens for text,
+    # but not for documents.  A Customer Map PDF therefore used to fail after
+    # a perfectly valid quote had been generated.  Drop only this peer's
+    # stale in-memory token and retry the attachment without the already-sent
+    # text; no business operation or local substitute file is created.
+    if media_files and isinstance(delivered, dict) and delivered.get("success") is not True:
+        live = getattr(weixin, "_LIVE_ADAPTERS", {}).get(token)
+        store = getattr(live, "_token_store", None)
+        account_id = extra["account_id"]
+        if store and account_id:
+            try:
+                store._cache.pop(store._key(account_id, user_id), None)
+            except Exception:
+                pass
+        retry = await weixin.send_weixin_direct(
+            extra=extra,
+            token=token,
+            chat_id=user_id,
+            message="",
+            media_files=media_files,
+        )
+        if isinstance(retry, dict) and retry.get("success") is True:
+            return retry
+        return {"error": f"{str(delivered.get('error') or 'Weixin media send failed.')[:400]} Retry without the expired Weixin session also failed: {str((retry or {}).get('error') if isinstance(retry, dict) else retry)[:400]}"}
+    return delivered
 
 
 async def _start_weixin_setup():
