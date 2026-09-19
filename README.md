@@ -31,7 +31,7 @@ The tool checks both per-dispatch routing and Hermes' concurrent session context
 
 ## Upgrading from 0.6.x
 
-Update with `hermes plugins update customer-map-platform --enable`, then restart the intended Hermes profile. `--enable` means the updated plugin remains enabled immediately; the user does not need to enable it again. Use **Authorize again / 重新扫码授权** in Customer Map's WeChat secretary settings once when upgrading an old 0.6.x authorization. No new Customer Map pairing is needed if the existing bridge binding is unchanged. An administrator's separate, explicit toolset-deny policy still takes precedence.
+Update with `hermes plugins update customer-map-platform`, then restart the intended Hermes profile. This Hermes CLI preserves an enabled plugin's state across a normal update; the user does not need a second enable command. Hermes can still disable any plugin its separate security scan blocks. Use **Authorize again / 重新扫码授权** in Customer Map's WeChat secretary settings once when upgrading an old 0.6.x authorization. No new Customer Map pairing is needed if the existing bridge binding is unchanged.
 
 WeChat's authorization page currently calls this iLink connection **OpenClaw** (`bot_type=3` in the native QR request). Hermes still handles the conversation. That name is supplied by WeChat, not this plugin's label. When WeChat displays a replacement warning, confirming the new connection disconnects the previously linked assistant for that WeChat account.
 
@@ -60,7 +60,7 @@ hermes plugins install https://github.com/ThisisPeggy/customer-map-hermes-connec
 For later releases, update without losing the enabled state:
 
 ```bash
-hermes plugins update customer-map-platform --enable
+hermes plugins update customer-map-platform
 hermes gateway restart
 ```
 

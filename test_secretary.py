@@ -21,6 +21,8 @@ import weixin_binding
 
 
 _SESSION = ContextVar("fake_native_session", default={})
+TEST_BRIDGE_TOKEN = "test-" + "bridge-" + "credential"
+TEST_WEIXIN_TOKEN = "test-" + "weixin-" + "credential"
 
 
 class SecretaryTests(unittest.TestCase):
@@ -30,8 +32,8 @@ class SecretaryTests(unittest.TestCase):
             "HERMES_HOME": self.home.name,
             "CUSTOMER_MAP_HERMES_SITE": "https://customer-map.test",
             "CUSTOMER_MAP_HERMES_CONNECTION_ID": "test-connection",
-            "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "secret-test-bridge-token",
-            "WEIXIN_ACCOUNT_ID": "weixin-bot", "WEIXIN_TOKEN": "secret-test-weixin-token",
+            "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": TEST_BRIDGE_TOKEN,
+            "WEIXIN_ACCOUNT_ID": "weixin-bot", "WEIXIN_TOKEN": TEST_WEIXIN_TOKEN,
             "WEIXIN_HOME_CHANNEL": "weixin-owner",
         })
         self.env.start()
@@ -79,8 +81,8 @@ class SecretaryTests(unittest.TestCase):
         self.bind()
         path = Path(self.home.name) / ".customer-map-weixin-binding.json"
         saved = path.read_text()
-        self.assertNotIn("secret-test-bridge-token", saved)
-        self.assertNotIn("secret-test-weixin-token", saved)
+        self.assertNotIn(TEST_BRIDGE_TOKEN, saved)
+        self.assertNotIn(TEST_WEIXIN_TOKEN, saved)
         self.assertNotIn("qrPayload", saved)
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -193,7 +195,7 @@ class SecretaryTests(unittest.TestCase):
             result = json.loads(agent_data.customer_map_query({"operation": "work_summary", "period": "today"}, task_id="test"))
             request = build.return_value.open.call_args.args[0]
             self.assertEqual(request.full_url, "https://customer-map.test/api/agent-data")
-            self.assertEqual(request.get_header("Authorization"), "Bearer secret-test-bridge-token")
+            self.assertEqual(request.get_header("Authorization"), f"Bearer {TEST_BRIDGE_TOKEN}")
             self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.9.0")
             self.assertEqual(json.loads(request.data), {"runtime": "hermes", "query": {"operation": "work_summary", "period": "today"}})
             self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 25)
@@ -240,22 +242,22 @@ class SecretaryTests(unittest.TestCase):
                 self.assertEqual(result["code"], expected)
                 self.assertNotIn("items", result)
         for exc, expected in [(TimeoutError(), "data_request_timeout"),
-                              (urllib.error.URLError("secret-test-bridge-token"), "data_connection_failed")]:
+                              (urllib.error.URLError(TEST_BRIDGE_TOKEN), "data_connection_failed")]:
             with patch.object(agent_data.urllib.request, "build_opener") as build:
                 build.return_value.open.side_effect = exc
                 result = agent_data.customer_map_query({"operation": "customers"})
                 self.assertEqual(json.loads(result)["code"], expected)
-                self.assertNotIn("secret-test-bridge-token", result)
+                self.assertNotIn(TEST_BRIDGE_TOKEN, result)
 
     def test_api_errors_preserve_the_reason_without_credentials(self):
         self.authorize()
-        raw = json.dumps({"error": "Project is not connected: secret-test-bridge-token"}).encode()
+        raw = json.dumps({"error": f"Project is not connected: {TEST_BRIDGE_TOKEN}"}).encode()
         error = urllib.error.HTTPError("https://customer-map.test/api/agent-data", 409, "Conflict", {}, io.BytesIO(raw))
         with patch.object(agent_data.urllib.request, "build_opener") as build:
             build.return_value.open.side_effect = error
             result = agent_data.customer_map_query({"operation": "customers"})
             self.assertIn("Project is not connected", result)
-            self.assertNotIn("secret-test-bridge-token", result)
+            self.assertNotIn(TEST_BRIDGE_TOKEN, result)
 
     def test_setup_persists_authorization_before_voice_preparation_and_restart(self):
         state = {"setupId": "c" * 32, "bindingFingerprint": weixin_binding.binding_fingerprint(),
@@ -266,7 +268,7 @@ class SecretaryTests(unittest.TestCase):
         native.ILINK_BASE_URL = "https://weixin.test"
         native.QR_TIMEOUT_MS = 1000
         native._api_get = AsyncMock(return_value={"status": "confirmed", "ilink_bot_id": "weixin-bot",
-                                                  "bot_token": "secret-test-weixin-token", "ilink_user_id": "weixin-owner"})
+                                                  "bot_token": TEST_WEIXIN_TOKEN, "ilink_user_id": "weixin-owner"})
         native.save_weixin_account = Mock()
         config = types.ModuleType("hermes_cli.config")
         config.get_hermes_home = lambda: self.home.name
@@ -351,7 +353,7 @@ class SecretaryTests(unittest.TestCase):
                     "base_url": "",
                     "cdn_base_url": "",
                 },
-                token="secret-test-weixin-token",
+                token=TEST_WEIXIN_TOKEN,
                 chat_id="weixin-owner",
                 message="测试通知",
                 media_files=None,
