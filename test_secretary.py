@@ -383,11 +383,13 @@ class SecretaryTests(unittest.TestCase):
                 calls.append(kwargs)
                 return {"success": len(calls) == 2, "message_id": "retry-id" if len(calls) == 2 else "", "error": "session timeout"}
 
-            with patch.object(sys.modules["gateway.platforms.weixin"], "send_weixin_direct", direct):
+            with patch.object(sys.modules["gateway.platforms.weixin"], "send_weixin_direct", direct), \
+                 patch.object(self.adapter_module, "_clear_weixin_context_token", new_callable=AsyncMock) as clear:
                 result = await self.adapter_module._send_weixin_notification(
                     "weixin-owner", "Customer Map 报价已生成。", [("/tmp/KA-QT-2609-0008.pdf", False)],
                 )
             self.assertTrue(result["success"])
+            clear.assert_awaited_once_with("weixin-bot", "weixin-owner")
             self.assertEqual(calls[0]["message"], "Customer Map 报价已生成。")
             self.assertEqual(calls[1]["message"], "")
             self.assertEqual(calls[0]["media_files"], calls[1]["media_files"])

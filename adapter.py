@@ -863,14 +863,7 @@ async def _send_weixin_notification(user_id, message, media_files=None):
     # stale in-memory token and retry the attachment without the already-sent
     # text; no business operation or local substitute file is created.
     if media_files and isinstance(delivered, dict) and delivered.get("success") is not True:
-        live = getattr(weixin, "_LIVE_ADAPTERS", {}).get(token)
-        store = getattr(live, "_token_store", None)
-        account_id = extra["account_id"]
-        if store and account_id:
-            try:
-                store._cache.pop(store._key(account_id, user_id), None)
-            except Exception:
-                pass
+        await _clear_weixin_context_token(extra["account_id"], user_id)
         retry = await weixin.send_weixin_direct(
             extra=extra,
             token=token,
@@ -882,6 +875,27 @@ async def _send_weixin_notification(user_id, message, media_files=None):
             return retry
         return {"error": f"{str(delivered.get('error') or 'Weixin media send failed.')[:400]} Retry without the expired Weixin session also failed: {str((retry or {}).get('error') if isinstance(retry, dict) else retry)[:400]}"}
     return delivered
+
+
+async def _clear_weixin_context_token(account_id, user_id):
+    """Remove one stale persisted iLink token before a document-only retry."""
+    if not account_id or not user_id:
+        return
+    try:
+        from gateway.platforms.weixin import ContextTokenStore
+        from hermes_constants import get_hermes_home
+        store = ContextTokenStore(str(get_hermes_home()))
+        store.restore(account_id)
+        key = store._key(account_id, user_id)
+        async with store._persist_lock:
+            if key not in store._cache:
+                return
+            store._cache.pop(key, None)
+            prefix = f"{account_id}:"
+            payload = {saved_key[len(prefix):]: value for saved_key, value in store._cache.items() if saved_key.startswith(prefix)}
+            await asyncio.to_thread(store._persist, account_id, payload)
+    except Exception as exc:
+        logger.warning("Could not clear stale Weixin context token before Customer Map file retry: %s", exc)
 
 
 async def _start_weixin_setup():
