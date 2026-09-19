@@ -554,9 +554,15 @@ def _on_pre_tool_call(**kwargs):
     tool_name = str(kwargs.get("tool_name") or "")
     args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
     target = str(args.get("name") or "") if tool_name == "tool_call" else tool_name
-    if target == DATA_TOOL_NAME and not current_data_context():
-        return {"action": "block", "message": "Customer Map data is not authorized for this chat. Authorize the Weixin owner from Customer Map first."}
-    if not is_customer_map_turn() and str(kwargs.get("session_id") or "") not in _CUSTOMER_MAP_SESSIONS:
+    context = current_data_context()
+    customer_map_session = is_customer_map_turn() or str(kwargs.get("session_id") or "") in _CUSTOMER_MAP_SESSIONS
+    if target in {DATA_TOOL_NAME, ACTION_TOOL_NAME} and not context:
+        return {"action": "block", "message": "Customer Map data and actions are not authorized for this chat. Authorize the Weixin owner from Customer Map first."}
+    # The authorized Weixin owner is a Customer Map business turn too.  It
+    # must receive the same fail-closed tool boundary as relay-originated
+    # Customer Map sessions; otherwise core artifact/file tools can fabricate
+    # a document that was never created in Customer Map.
+    if not context and not customer_map_session:
         return
     if tool_name in TOOL_SEARCH_CATALOG_TOOLS:
         content = _tool_activity(tool_name, args)

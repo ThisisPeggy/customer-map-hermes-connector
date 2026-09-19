@@ -179,6 +179,20 @@ class SecretaryTests(unittest.TestCase):
         self.authorize()
         self.assertIsNone(self.adapter_module._on_pre_tool_call(session_id="restored", tool_name="customer_map_query", args={"operation": "customers"}))
 
+    def test_authorized_weixin_cannot_generate_or_attach_local_business_files(self):
+        self.authorize()
+        for name, args in [
+            ("terminal", {"command": "make quote.pdf"}),
+            ("file_write", {"path": "/tmp/quote.pdf"}),
+            ("tool_call", {"name": "artifact_create", "arguments": "{}"}),
+        ]:
+            with self.subTest(name=name):
+                result = self.adapter_module._on_pre_tool_call(session_id="weixin-owner", tool_name=name, args=args)
+                self.assertEqual(result["action"], "block")
+        self.assertIsNone(self.adapter_module._on_pre_tool_call(
+            session_id="weixin-owner", tool_name="customer_map_action", args={"kind": "create", "operationType": "quote_create"},
+        ))
+
     def test_restored_customer_map_sessions_keep_mail_and_terminal_blocked(self):
         self.dispatch(self.event(platform="customer_map", chat_id="cm-chat", user_id="cm-user", relay=True))
         self.assertTrue(secretary_context.is_customer_map_turn())
