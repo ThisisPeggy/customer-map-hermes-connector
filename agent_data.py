@@ -15,24 +15,26 @@ except ImportError:
 
 DATA_TOOLSET = "customer-map-data"
 TOOL_NAME = "customer_map_query"
-OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "product_lists", "quotes", "follow_ups", "mail_activity", "exchange_rate_chart")
+OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "product_lists", "quotes", "follow_ups", "mail_activity", "mailboxes", "inbox_search", "inbox_message", "exchange_rate_chart")
 MAX_RESPONSE_BYTES = 512_000
 QUERY_SCHEMA = {
     "name": TOOL_NAME,
-    "description": "Read the bound user's Customer Map cloud records. Use work_summary for exact activity counts, customers to resolve company names to IDs, product_lists to resolve products and pricing inputs, and exchange_rate_chart when the owner asks to generate and send the current exchange-rate chart to Weixin. Honor period, metric definitions, and source coverage; unavailable is not zero.",
+    "description": "Read the bound user's Customer Map records and authorized connected inboxes. Use mailboxes to discover connected accounts, inbox_search for bounded read-only search, inbox_message to read one selected message, and exchange_rate_chart when the owner asks to generate and send the current exchange-rate chart to Weixin. Honor period, metric definitions, and source coverage; unavailable is not zero. Inbox reads never send mail.",
     "parameters": {
         "type": "object", "additionalProperties": False, "required": ["operation"],
         "properties": {
             "operation": {"type": "string", "enum": list(OPERATIONS)},
-            "period": {"type": "string", "enum": ["today", "yesterday", "tomorrow", "last7days", "last30days", "custom", "all"], "description": "Defaults to today for work_summary/mail_activity/follow_ups, all for lists. Custom requires from and through. Capabilities and customer_detail have no date filter. Future periods are only meaningful for follow-ups; summary cannot use all."},
+            "period": {"type": "string", "enum": ["today", "yesterday", "tomorrow", "last7days", "last30days", "custom", "all"], "description": "Defaults to today for work_summary/mail_activity/follow_ups, last30days for inbox_search, and all for lists. Custom requires from and through. Capabilities, customer_detail, mailboxes and inbox_message have no date filter. Future periods are only meaningful for follow-ups; summary cannot use all."},
             "from": {"type": "string", "description": "Inclusive YYYY-MM-DD for a custom period (at most one year)."},
             "through": {"type": "string", "description": "Inclusive YYYY-MM-DD for a custom period."},
             "timezone": {"type": "string", "description": "IANA timezone; omit to use the user's secretary settings."},
-            "search": {"type": "string", "maxLength": 160, "description": "Company substring; customers or quotes only."},
+            "search": {"type": "string", "maxLength": 160, "description": "Company substring for customers/quotes, or sender/subject/body terms for inbox_search."},
             "country": {"type": "string", "maxLength": 100, "description": "Exact saved country value; customers only."},
             "customerId": {"type": "string", "maxLength": 160, "description": "Real ID from customers. Required for customer_detail; optional for work_summary, quotes, follow_ups, mail_activity."},
             "quoteId": {"type": "string", "maxLength": 160, "description": "Real quote ID; quotes (returns line items) or follow_ups only."},
             "productListId": {"type": "string", "maxLength": 160, "description": "Real product list ID; product_lists returns up to 200 product rows when provided."},
+            "mailboxId": {"type": "string", "maxLength": 160, "description": "Connected mailbox ID from mailboxes. Optional for inbox_search; required for inbox_message."},
+            "messageId": {"type": "string", "maxLength": 1000, "description": "Message ID from inbox_search; required with mailboxId for inbox_message."},
             "relationshipStatus": {"type": "string", "enum": ["有回复", "有兴趣", "有询价", "成交过"], "description": "customers only: CURRENT relationship state, not reply/inquiry events during a period."},
             "mailKind": {"type": "string", "enum": ["sent", "reply", "bounce"], "description": "mail_activity only; defaults to sent."},
             "includeOverdue": {"type": "boolean", "description": "follow_ups only; defaults to true. False restricts to tasks due within the selected period."},
@@ -83,11 +85,11 @@ def customer_map_query(args, **_kwargs):
             "Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json",
             # Cloudflare rejects urllib's generic Python user agent before the
             # Customer Map function can validate the delegated bridge token.
-            "User-Agent": "Customer-Map-Hermes/0.9.0",
+            "User-Agent": "Customer-Map-Hermes/0.10.0",
         })
         # In particular, never forward the bridge credential to a redirected host.
         opener = urllib.request.build_opener(_NoRedirect())
-        with opener.open(request, timeout=25) as response:
+        with opener.open(request, timeout=40) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
             if len(raw) > MAX_RESPONSE_BYTES:
                 return _failure("response_too_large", "Customer Map returned too much data. Narrow the query or reduce the page size.")

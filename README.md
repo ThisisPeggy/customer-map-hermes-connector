@@ -8,11 +8,13 @@ Successful QR authorization is saved before voice preparation and survives gatew
 
 Version 0.9.0 accepts integrity-bound file notifications from the paired Customer Map origin. Files are downloaded with the Connector binding token into a private temporary directory, delivered to the bound Weixin owner, and deleted immediately afterward. Arbitrary URLs, redirects, unsupported file types, and files larger than 15 MB are rejected. The Connector does not send voice replies.
 
+Version 0.10.0 adds read-only discovery of connected mailboxes plus bounded inbox search and single-message reading. Only mailboxes enabled in Customer Map settings are available. Search/read never sends mail; a reply still uses the existing `mail_reply` action and requires the owner's explicit confirmation code.
+
 The plugin retains SILK decoder and local speech-to-text preparation during QR setup, followed by an automatic gateway restart. Direct messages are restricted to the scanning user. Ordinary Customer Map turns retain a fail-closed allowlist, including on restored sessions: read-only business queries, confirmation-gated Customer Map actions, built-in web search/extraction, and installed skill loading. The action tool can stage customers, products, quotations, PIs, Task Assistant campaigns, email replies, and quote-file delivery; the server, not the model, validates and executes them after explicit confirmation. A configured Firecrawl MCP server contributes only `firecrawl_search` and non-interactive, public-URL `firecrawl_scrape`. The scoped `tool_search`, `tool_describe`, and `tool_call` bridge cannot bypass these checks. Terminal, arbitrary local files, code execution, delegation, kanban, cron, arbitrary MCP, memory writes, raw session search, and unconfirmed model-driven mail remain unavailable on the Customer Map platform. Native tools on unrelated Hermes platforms are not reconfigured.
 
 ## Business query API
 
-Deploy Customer Map's matching `/api/agent-data` implementation before using 0.7.0 queries. Requests use `POST {"runtime":"hermes","query":{...}}` and the bound bridge token in the Authorization header. The server determines the account and calculates totals; the model cannot override identity, credentials, endpoints, tables, or SQL. Requests have a 25-second timeout and a bounded response size, and never follow redirects with the credential.
+Deploy Customer Map's matching `/api/agent-data` implementation before using 0.7.0 queries. Requests use `POST {"runtime":"hermes","query":{...}}` and the bound bridge token in the Authorization header. The server determines the account and calculates totals; the model cannot override identity, credentials, endpoints, tables, or SQL. Requests have a 40-second timeout and a bounded response size, and never follow redirects with the credential.
 
 | Operation | Records returned |
 | --- | --- |
@@ -24,8 +26,11 @@ Deploy Customer Map's matching `/api/agent-data` implementation before using 0.7
 | `quotes` | Quotes for a customer; a quote ID includes line items |
 | `follow_ups` | Scheduled customer and quote tasks, due dates and overdue filtering |
 | `mail_activity` | Sent, detected-reply or recorded-bounce events |
+| `mailboxes` | Connected mailbox IDs, providers, addresses and secretary-search access |
+| `inbox_search` | Live read-only search across enabled connected inboxes; summaries only |
+| `inbox_message` | Live content for one message selected by mailbox ID and message ID |
 
-Date ranges use the user's saved timezone unless explicitly overridden. A created quote may be a draft; detected replies cover synced events, not every mailbox. Current inquiry-state customers are queryable, but independent inquiry counts are unavailable. Charts, inquiry creation and custom task management are not implemented by this version. Customer-owned Supabase projects that the website server cannot access return an explicit error instead of querying a different project.
+Date ranges use the user's saved timezone unless explicitly overridden. Inbox search defaults to the last 30 days and can use `all` when a narrower search needs older mail. Search and message bodies are returned only for the current request and are not copied into customer records. A created quote may be a draft; detected replies cover synced events, not every mailbox. Current inquiry-state customers are queryable, but independent inquiry counts are unavailable. Charts, inquiry creation and custom task management are not implemented by this version. Customer-owned Supabase projects that the website server cannot access return an explicit error instead of querying a different project.
 
 The tool checks both per-dispatch routing and Hermes' concurrent session context on every call. It refuses unrelated chats, groups, contextless calls and stale bindings, even if the tool is visible in another platform's tool catalog. It never reads data during the pre-dispatch hook, which runs before native gateway authorization.
 

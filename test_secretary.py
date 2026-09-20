@@ -210,9 +210,9 @@ class SecretaryTests(unittest.TestCase):
             request = build.return_value.open.call_args.args[0]
             self.assertEqual(request.full_url, "https://customer-map.test/api/agent-data")
             self.assertEqual(request.get_header("Authorization"), f"Bearer {TEST_BRIDGE_TOKEN}")
-            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.9.0")
+            self.assertEqual(request.get_header("User-agent"), "Customer-Map-Hermes/0.10.0")
             self.assertEqual(json.loads(request.data), {"runtime": "hermes", "query": {"operation": "work_summary", "period": "today"}})
-            self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 25)
+            self.assertEqual(build.return_value.open.call_args.kwargs["timeout"], 40)
             self.assertIsInstance(build.call_args.args[0], agent_data._NoRedirect)
             self.assertEqual(result, payload)
 
@@ -223,6 +223,13 @@ class SecretaryTests(unittest.TestCase):
                 result = json.loads(agent_data.customer_map_query({"operation": "customers", key: "override"}))
                 self.assertEqual(result["code"], "invalid_query")
             build.assert_not_called()
+
+    def test_inbox_query_schema_has_server_scoped_message_locators(self):
+        properties = agent_data.QUERY_SCHEMA["parameters"]["properties"]
+        self.assertIn("mailboxes", agent_data.OPERATIONS)
+        self.assertIn("inbox_search", agent_data.OPERATIONS)
+        self.assertIn("inbox_message", agent_data.OPERATIONS)
+        self.assertEqual(properties["messageId"]["maxLength"], 1000)
 
     def test_unauthorized_query_has_no_network_side_effect(self):
         with patch.object(agent_data.urllib.request, "build_opener") as build:

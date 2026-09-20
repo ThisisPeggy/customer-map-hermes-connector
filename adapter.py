@@ -39,7 +39,7 @@ except ImportError:
     from weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.10.0"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 NOTIFICATION_CACHE_LIMIT = 500
