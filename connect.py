@@ -4,6 +4,8 @@
 import argparse
 import json
 import os
+import re
+import socket
 import tempfile
 import urllib.request
 from pathlib import Path
@@ -22,13 +24,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--site", required=True)
     parser.add_argument("--code", required=True)
+    parser.add_argument("--new-instance", action="store_true", help="Create a separate identity after copying a Hermes profile to another computer")
     args = parser.parse_args()
     site = args.site.rstrip("/")
     _require_safe_url(site, {"https"}, {"http"})
-    client_id = str(uuid.uuid4())
+    client_id = _profile_client_id(new_instance=args.new_instance)
     request = urllib.request.Request(
         f"{site}/api/hermes-link",
-        data=json.dumps({"action": "claim", "code": args.code, "clientId": client_id, "pluginVersion": PLUGIN_VERSION}).encode(),
+        data=json.dumps({"action": "claim", "code": args.code, "clientId": client_id, "pluginVersion": PLUGIN_VERSION, "deviceName": socket.gethostname()[:60]}).encode(),
         headers={"Content-Type": "application/json", "User-Agent": f"CustomerMap-Hermes/{PLUGIN_VERSION}"},
         method="POST",
     )
@@ -53,6 +56,21 @@ def main():
         raise SystemExit(f"Hermes was paired, but Customer Map tool isolation could not be configured: {exc}")
     print("Hermes is paired with Customer Map. Restart the Hermes gateway to connect.")
     print("  hermes gateway restart")
+
+
+def _profile_client_id(home=None, new_instance=False):
+    """Reconnect the same profile without creating an orphan cloud device."""
+    if not new_instance:
+        profile = Path(home) if home is not None else Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        env_path = profile / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "CUSTOMER_MAP_HERMES_CLIENT_ID":
+                    value = value.strip().strip("\"'")
+                    if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+                        return value
+    return str(uuid.uuid4())
 
 
 def _require_safe_url(value, secure_schemes, local_schemes):
