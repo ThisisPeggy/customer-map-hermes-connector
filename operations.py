@@ -1,4 +1,4 @@
-"""Confirmed Customer Map business actions for the authorized Weixin owner."""
+"""Customer Map business actions and previewed mail for the authorized Weixin owner."""
 
 import json
 import os
@@ -8,10 +8,10 @@ import urllib.request
 
 try:
     from .agent_data import _NoRedirect, _endpoint, _failure
-    from .secretary_context import current_data_context, current_user_source, current_user_text
+    from .secretary_context import current_data_context, current_user_evidence, current_user_source, current_user_text
 except ImportError:
     from agent_data import _NoRedirect, _endpoint, _failure
-    from secretary_context import current_data_context, current_user_source, current_user_text
+    from secretary_context import current_data_context, current_user_evidence, current_user_source, current_user_text
 
 
 TOOL_NAME = "customer_map_action"
@@ -20,14 +20,14 @@ KINDS = ("create", "confirm", "cancel")
 OPERATION_TYPES = ("customer_create", "product_list_create", "product_item_create", "quote_create", "quote_to_pi", "quote_deliver_weixin", "campaign_create", "mail_reply")
 SCHEMA = {
     "name": TOOL_NAME,
-    "description": "Create a Customer Map operation preview, or confirm/cancel one only when the owner's current message explicitly contains its confirmation code. Never claim completion unless the tool succeeds.",
+    "description": "Execute explicitly requested Customer Map business creates and file delivery to the owner. mail_reply only creates a frozen preview: show its complete sender, recipient, subject, body and attachments (currently []); mail attachments are unsupported. On a later user turn use confirm for 发送/确认发送/send, or cancel for 取消/cancel/修改. An optional recipient such as 发送 alice@example.com disambiguates pending mail. The server resolves the pending mail from the owner's original message; never claim completion unless the tool succeeds.",
     "parameters": {
         "type": "object", "additionalProperties": False, "required": ["kind"],
         "properties": {
             "kind": {"type": "string", "enum": list(KINDS)},
             "operationType": {"type": "string", "enum": list(OPERATION_TYPES)},
             "actionId": {"type": "string", "description": "Stable UUID idempotency ID for create; reuse it only when retrying the identical request."},
-            "operationId": {"type": "string", "description": "Operation UUID returned by create."},
+            "operationId": {"type": "string", "description": "Optional operation UUID returned by create. It cannot disambiguate pending mail; the owner's current message must identify the recipient when needed."},
             "payload": {"type": "object", "description": "Fields by operation: customer_create={company,country,website?,email?,contact?,phone?,shippingAddress?,notes?}; product_list_create={name,costCurrency?,saleCurrency?,exchangeRate?,marginPct?,priceDecimals?,note?,items:[{model,costPrice,leadTime?,extra?}]}; product_item_create={productListId,model,costPrice,leadTime?,extra?,sortOrder?}; quote_create={customerId,subject?,salutation?,introText?,validity?,paymentTerms?,deliveryTerms?,warranty?,paymentFee?,freightFee?,includeBankDetails?,bankBeneficiary?,bankName?,bankAddress?,bankAccount?,bankSwift?,bankChargesNote?,signerName?,signerEmail?,deliverToWeixin?,items:[{model,qty,value,valueCurrency?,brand?,leadTime?,condition?,extra?}]}; quote_to_pi={quoteId,deliverToWeixin?}; quote_deliver_weixin={quoteId}; campaign_create={title,goal,customerIds,productListId?,productListName?}; mail_reply={recipient,subject,body}. IDs must come from customer_map_query results."},
         },
     },
@@ -43,11 +43,14 @@ def customer_map_action(args, **_kwargs):
     kind = args["kind"]
     if kind == "create" and args.get("operationType") not in OPERATION_TYPES:
         return _failure("invalid_action", "Choose a supported operation type.")
-    if kind != "create" and not args.get("operationId"):
-        return _failure("invalid_action", "The operation ID is required.")
     action = dict(args)
     action["originalInstruction"] = current_user_text()
     action["source"] = current_user_source()
+    evidence = current_user_evidence()
+    if evidence is None and (kind != "create" or args.get("operationType") == "mail_reply"):
+        return _failure("action_evidence_missing", "The original Weixin message ID and timestamp are unavailable. Send a new message; if this persists, update the native Hermes Weixin runtime and Connector to preserve inbound evidence.")
+    if evidence is not None:
+        action["sourceMessageId"], action["sourceMessageAt"] = evidence
     if kind in {"confirm", "cancel"}:
         action["confirmationText"] = current_user_text()
     token = os.getenv("CUSTOMER_MAP_HERMES_BRIDGE_TOKEN", "").strip()
@@ -85,5 +88,5 @@ def register_action_tool(ctx, check_fn):
     ctx.register_tool(
         name=TOOL_NAME, toolset=TOOLSET, schema=SCHEMA, handler=customer_map_action,
         check_fn=check_fn, requires_env=["CUSTOMER_MAP_HERMES_SITE", "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN", "CUSTOMER_MAP_HERMES_CONNECTION_ID"],
-        description="Confirmed Customer Map business operations", emoji="✅",
+        description="Customer Map business actions and previewed mail", emoji="✅",
     )

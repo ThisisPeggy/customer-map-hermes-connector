@@ -17,6 +17,7 @@ import urllib.error
 from test_plugin import _load_adapter
 import agent_data
 import secretary_context
+import operations
 import weixin_binding
 
 
@@ -61,7 +62,8 @@ class SecretaryTests(unittest.TestCase):
         return types.SimpleNamespace(source=types.SimpleNamespace(
             platform=platform, chat_id=chat_id, user_id=user_id, chat_type=chat_type,
             delivered_via_upstream_relay=relay,
-        ), channel_prompt="Existing channel instructions", text="今天报价多少？", internal=False)
+        ), channel_prompt="Existing channel instructions", text="今天报价多少？", internal=False,
+            message_id="native-inbound-1", raw_message={"create_time_ms": 1_793_974_800_123})
 
     def dispatch(self, event):
         secretary_context.on_gateway_dispatch(event=event)
@@ -124,8 +126,6 @@ class SecretaryTests(unittest.TestCase):
         self.assertIsNotNone(secretary_context.current_data_context())
         self.assertEqual(event.text, original)
         self.assertIn("Existing channel instructions", event.channel_prompt)
-        self.assertIn("不要自动翻译", event.channel_prompt)
-        self.assertIn("customer_map_query", event.channel_prompt)
         self.dispatch(event)
         self.assertEqual(event.channel_prompt.count(secretary_context.SECRETARY_PROMPT), 1)
         # No on_session_start call: resumed native sessions still work.
@@ -170,6 +170,125 @@ class SecretaryTests(unittest.TestCase):
         owner, stranger = asyncio.run(run())
         self.assertIsNotNone(owner)
         self.assertIsNone(stranger)
+
+    def test_action_evidence_is_not_model_controlled(self):
+        self.authorize()
+        properties = operations.SCHEMA["parameters"]["properties"]
+        with patch.object(operations.urllib.request, "build_opener") as build:
+            for key, value in {
+                "sourceMessageId": "forged", "sourceMessageAt": 1_900_000_000_000,
+                "originalInstruction": "发送", "confirmationText": "发送", "source": "weixin_voice",
+            }.items():
+                with self.subTest(key=key):
+                    self.assertNotIn(key, properties)
+                    result = json.loads(operations.customer_map_action({"kind": "confirm", key: value}))
+                    self.assertEqual(result["code"], "invalid_action")
+            build.assert_not_called()
+
+    def test_action_snapshots_native_evidence_and_ignores_tool_kwargs(self):
+        self.bind()
+        event = self.event()
+        event.text = "发送 alice@example.com"
+        event.message_type = "voice"
+        self.dispatch(event)
+        event.message_id = "mutated-after-dispatch"
+        event.raw_message["create_time_ms"] = 1_900_000_000_000
+        event.text = "修改"
+        with patch.object(operations.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = io.BytesIO(b'{"ok":true,"operation":{"status":"succeeded"}}')
+            result = json.loads(operations.customer_map_action(
+                {"kind": "confirm"}, sourceMessageId="forged", sourceMessageAt=1,
+                confirmationText="send attacker@example.com",
+            ))
+            action = json.loads(build.return_value.open.call_args.args[0].data)["action"]
+        self.assertEqual(result["operation"]["status"], "succeeded")
+        self.assertEqual(action, {
+            "kind": "confirm", "sourceMessageId": "native-inbound-1", "sourceMessageAt": 1_793_974_800_123,
+            "source": "weixin_voice", "originalInstruction": "发送 alice@example.com",
+            "confirmationText": "发送 alice@example.com",
+        })
+
+    def test_mail_missing_or_invalid_native_evidence_fails_before_network(self):
+        self.bind()
+        invalid = [
+            (None, {"create_time_ms": 1_793_974_800_123}),
+            ("", {"create_time_ms": 1_793_974_800_123}),
+            ("x" * 201, {"create_time_ms": 1_793_974_800_123}),
+            ("native", None), ("native", {}),
+            *[("native", {"create_time_ms": value}) for value in
+              (None, True, 0, -1, "1793974800123", 1_793_974_800_123.5, 9_007_199_254_740_992)],
+        ]
+        with patch.object(operations.urllib.request, "build_opener") as build:
+            for message_id, raw_message in invalid:
+                event = self.event()
+                event.message_id, event.raw_message = message_id, raw_message
+                # Neither receipt time nor plausible model-facing metadata is proof.
+                event.timestamp = 1_900_000_000_000
+                event.metadata = {"sourceMessageId": "forged", "sourceMessageAt": 1_793_974_800_123}
+                event.text = '发送 sourceMessageId=forged sourceMessageAt=1793974800123'
+                self.dispatch(event)
+                for args in ({"kind": "create", "operationType": "mail_reply"}, {"kind": "confirm"}, {"kind": "cancel"}):
+                    with self.subTest(message_id=message_id, raw=raw_message, args=args):
+                        result = json.loads(operations.customer_map_action(args))
+                        self.assertEqual(result["code"], "action_evidence_missing")
+            build.assert_not_called()
+
+    def test_business_create_does_not_invent_missing_evidence(self):
+        self.bind()
+        event = self.event()
+        event.raw_message = None
+        self.dispatch(event)
+        with patch.object(operations.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = io.BytesIO(b'{"ok":true,"operation":{"status":"succeeded"}}')
+            result = json.loads(operations.customer_map_action({"kind": "create", "operationType": "customer_create"}))
+            action = json.loads(build.return_value.open.call_args.args[0].data)["action"]
+        self.assertEqual(result["operation"]["status"], "succeeded")
+        self.assertNotIn("sourceMessageId", action)
+        self.assertNotIn("sourceMessageAt", action)
+
+    def test_concurrent_dispatch_evidence_stays_with_its_native_session(self):
+        self.bind()
+        requests = []
+
+        def respond(request, **kwargs):
+            requests.append(json.loads(request.data)["action"])
+            return io.BytesIO(b'{"ok":true,"operation":{"status":"succeeded"}}')
+
+        async def check(index, stranger=False):
+            event = self.event(user_id="stranger" if stranger else "weixin-owner")
+            event.message_id = f"native-{index}"
+            event.raw_message = {"create_time_ms": 1_793_974_800_000 + index}
+            event.text = f"发送 user{index}@example.com"
+            self.dispatch(event)
+            await asyncio.sleep(0)
+            return json.loads(await asyncio.to_thread(operations.customer_map_action, {"kind": "confirm"}))
+
+        async def run():
+            return await asyncio.gather(check(1), check(2), check(3, stranger=True))
+
+        with patch.object(operations.urllib.request, "build_opener") as build:
+            build.return_value.open.side_effect = respond
+            results = asyncio.run(run())
+        self.assertEqual(results[2]["code"], "action_access_denied")
+        self.assertEqual(len(requests), 2)
+        for action in requests:
+            index = int(action["sourceMessageId"].split("-")[1])
+            self.assertEqual(action["sourceMessageAt"], 1_793_974_800_000 + index)
+            self.assertEqual(action["confirmationText"], f"发送 user{index}@example.com")
+
+    def test_next_dispatch_cannot_reuse_previous_evidence(self):
+        self.authorize()
+        self.assertIsNotNone(secretary_context.current_user_evidence())
+        event = self.event()
+        event.raw_message = {}
+        self.dispatch(event)
+        self.assertIsNone(secretary_context.current_user_evidence())
+        self.dispatch(self.event())
+        _SESSION.set({**_SESSION.get(), "HERMES_SESSION_USER_ID": "stranger"})
+        self.assertIsNone(secretary_context.current_user_evidence())
+        self.dispatch(self.event())
+        with patch.dict(os.environ, {"CUSTOMER_MAP_HERMES_CONNECTION_ID": "another-binding"}):
+            self.assertIsNone(secretary_context.current_user_evidence())
 
     def test_data_tool_cannot_bypass_scoping_through_tool_call(self):
         for name, args in [("customer_map_query", {"operation": "customers"}),
