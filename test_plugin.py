@@ -293,6 +293,88 @@ async def _check_streaming_response_frames():
     assert adapter._pending["session-stream"]["last_content"] == "第一段第二段"
 
 
+def _check_research_source_evidence():
+    module = _load_adapter()
+    good = "https://example.com/actual"
+    unread = "https://example.com/unread"
+    blocked = "https://example.com/blocked"
+    private = "http://127.0.0.1/private"
+    credentials = "https://name:password@example.com/"
+    assert module._research_tool_sources("web_search", {"query": "companies"}, {"success": True, "data": {"web": [{"url": unread}]}}) == (True, [])
+    args = {"urls": [good, unread, blocked, private, credentials]}
+    result = {"results": [
+        {"url": good, "content": "public content"},
+        {"url": unread, "content": "", "error": "not found"},
+        {"url": blocked, "content": "blocked", "blocked_by_policy": True},
+        {"url": private, "content": "private"},
+        {"url": credentials, "content": "not public"},
+        {"url": "https://example.com/unrequested", "content": "not requested"},
+    ]}
+    assert module._research_tool_sources("web_extract", args, json.dumps(result)) == (False, [good])
+    assert module._research_tool_sources("web_extract", args, '{"error":"failure"}') == (False, [])
+    assert module._research_tool_sources("tool_call", args, result) == (False, [])
+
+
+async def _check_research_session_binding(*, collision):
+    module = _load_adapter()
+    adapter = module.CustomerMapAdapter({})
+    messages = []
+
+    async def send_json(value):
+        messages.append(value)
+
+    adapter._ws = SimpleNamespace(closed=False, send_json=send_json)
+    from gateway.session import build_session_key
+    adapter._session_store = SimpleNamespace(
+        _resolve_profile_for_key=lambda source: None,
+        get_or_create_session=lambda source: SimpleNamespace(
+            session_key=build_session_key(source, group_sessions_per_user=True, thread_sessions_per_user=False, profile=None),
+            session_id="shared" if collision else f"hermes:{source.chat_id}",
+        ),
+    )
+    first_entered, release_first = asyncio.Event(), asyncio.Event()
+
+    async def handle_message(event):
+        job = event.source.chat_id
+        if job == "one":
+            first_entered.set()
+            await release_first.wait()
+        session = "shared" if collision else f"hermes:{job}"
+        module._on_session_start(platform="customer_map", session_id=session)
+        url = f"https://example.com/{job}"
+        module._on_post_tool_call(session_id=session, tool_name="web_search", args={"query": "buyers"}, result={"success": True, "data": {"web": []}})
+        cancelled = f"{url}/cancelled"
+        module._on_post_tool_call(session_id=session, tool_name="web_extract", status="cancelled", args={"urls": [cancelled]}, result={"results": [{"url": cancelled, "content": "not completed"}]})
+        module._on_post_tool_call(session_id=session, tool_name="web_extract", args={"urls": [url]}, result={"results": [{"url": url, "content": "public content"}]})
+        await adapter.send(job, "https://example.com/model-only", metadata={"notify": True})
+
+    def turn(name):
+        return adapter._run_job({"id": f"job-{name}", "timeoutMs": 10000, "request": {"sessionId": name, "researchEvidenceVersion": 2}})
+
+    adapter.handle_message = handle_message
+    with module._ACTIVE_ADAPTERS_LOCK:
+        module._ACTIVE_ADAPTERS.add(adapter)
+    first = asyncio.create_task(turn("one"))
+    try:
+        await asyncio.wait_for(first_entered.wait(), timeout=1)
+        await turn("two")
+    finally:
+        release_first.set()
+        try:
+            await first
+        finally:
+            with module._ACTIVE_ADAPTERS_LOCK:
+                module._ACTIVE_ADAPTERS.discard(adapter)
+    completed = {item["jobId"]: item for item in messages if item["type"] == "complete"}
+    for name in ("one",) if collision else ("one", "two"):
+        response = completed[f"job-{name}"]["response"]
+        assert response["researchEvidenceVersion"] == 2
+        assert response["researchSources"] == {"requestId": f"job-{name}", "searched": True, "readUrls": [f"https://example.com/{name}"]}
+    if collision:
+        assert "already in use" in completed["job-two"]["error"]
+        assert completed["job-two"]["response"] is None
+
+
 def _check_safe_tool_activity():
     module = _load_adapter()
     assert module._tool_activity("web_search", {"query": "Raute OYJ contact"}) == "正在搜索：Raute OYJ contact"
@@ -942,6 +1024,9 @@ def run_checks():
     _check_env_write()
     _check_safe_platform_composite()
     _check_safe_tool_activity()
+    _check_research_source_evidence()
+    asyncio.run(_check_research_session_binding(collision=False))
+    asyncio.run(_check_research_session_binding(collision=True))
     _check_tool_call_boundary()
     asyncio.run(_check_tool_activity_progress())
     _check_mail_backend_capability()
