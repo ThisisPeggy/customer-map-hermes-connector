@@ -18,6 +18,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType
 from gateway.config import Platform
@@ -39,7 +40,7 @@ except ImportError:
     from weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.10.0"
+PLUGIN_VERSION = "0.12.0"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 NOTIFICATION_CACHE_LIMIT = 500
@@ -215,6 +216,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
             "hermes_session_id": self._hermes_sessions.get(session_id, ""),
             "session_key": "",
             "cancelled": False,
+            "research_sources": {"searched": False, "readUrls": []} if request.get("researchEvidenceVersion") == 2 else None,
         }
         try:
             if request.get("weixinSetupAction") is not None:
@@ -257,6 +259,17 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
                 profile=session_store._resolve_profile_for_key(source) if session_store else None,
             )
+            pending = self._pending[session_id]
+            if pending["research_sources"] is not None:
+                if not session_store:
+                    raise RuntimeError("Research requires a gateway session store")
+                entry = session_store.get_or_create_session(source)
+                if not getattr(entry, "session_id", None) or entry.session_key != pending["session_key"]:
+                    raise RuntimeError("Research gateway session binding unavailable")
+                session = str(entry.session_id)
+                if any(item is not pending and item["hermes_session_id"] == session for item in self._pending.values()):
+                    raise RuntimeError("Research gateway session already in use")
+                pending["hermes_session_id"] = session
             event = MessageEvent(
                 text=_request_text(request.get("input")),
                 message_type=MessageType.TEXT,
@@ -271,7 +284,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
             pending = self._pending.get(session_id) or {}
             last_content = str(pending.get("last_content") or "").strip()
             if _looks_like_final_response(last_content):
-                await self._complete(job_id, response={"output_text": last_content})
+                await self._complete(job_id, response=self._turn_response(pending, last_content))
             else:
                 detail = _compact_status(last_content)
                 message = "Hermes did not return a final message before the task timed out. The task has stopped and will not continue in the background."
@@ -425,7 +438,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
         await self._progress(job_id, str(content))
         if not isinstance(metadata, dict) or metadata.get("notify") is not True:
             return SendResult(success=True, message_id=job_id)
-        if not await self._complete(job_id, response={"output_text": str(content)}):
+        if not await self._complete(job_id, response=self._turn_response(pending, str(content))):
             return SendResult(success=False, error="Customer Map relay is disconnected", retryable=True)
         completion = pending["completion"]
         if not completion.done():
@@ -448,7 +461,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
         completion = pending["completion"]
         last_content = str(pending.get("last_content") or "").strip()
         if last_content:
-            if await self._complete(pending["job_id"], response={"output_text": last_content}):
+            if await self._complete(pending["job_id"], response=self._turn_response(pending, last_content)):
                 if not completion.done():
                     completion.set_result(last_content)
                 return
@@ -461,6 +474,29 @@ class CustomerMapAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id):
         return {"name": "Customer Map", "type": "dm", "chat_id": str(chat_id)}
+
+    @staticmethod
+    def _turn_response(pending, content):
+        result = {"output_text": content}
+        sources = pending.get("research_sources")
+        if sources is not None:
+            result["researchEvidenceVersion"] = 2
+            result["researchSources"] = {"requestId": pending["job_id"], "searched": sources["searched"], "readUrls": list(sources["readUrls"])}
+        return result
+
+    def record_research_sources(self, session_id, searched, urls):
+        matches = [item for item in list(self._pending.values()) if session_id and item["hermes_session_id"] == str(session_id)]
+        if len(matches) != 1 or matches[0]["cancelled"]:
+            return
+        sources = matches[0].get("research_sources")
+        if sources is None:
+            return
+        sources["searched"] = sources["searched"] or searched
+        for url in urls:
+            if len(sources["readUrls"]) >= 100:
+                break
+            if url not in sources["readUrls"]:
+                sources["readUrls"].append(url)
 
     async def _complete(self, job_id, response=None, error=""):
         if not self._ws or self._ws.closed:
@@ -479,7 +515,7 @@ class CustomerMapAdapter(BasePlatformAdapter):
 
     def remember_hermes_session(self, session_id):
         for customer_map_session_id, pending in self._pending.items():
-            if not pending["hermes_session_id"]:
+            if not pending["hermes_session_id"] and pending.get("research_sources") is None:
                 pending["hermes_session_id"] = str(session_id)
                 self._hermes_sessions[customer_map_session_id] = str(session_id)
                 return
@@ -537,6 +573,7 @@ def _capabilities():
         "agentDataQuery": "supported",
         "agentDataApiVersion": 1,
         "weixinDataBinding": "verified" if load_weixin_binding() else "unbound",
+        "researchEvidenceVersion": 2,
     }
 
 
@@ -609,7 +646,42 @@ def _on_post_tool_call(**kwargs):
     if not label:
         return
     failed = kwargs.get("status") in {"error", "blocked"} or bool(kwargs.get("error_type"))
+    if not failed and kwargs.get("status") != "cancelled":
+        searched, urls = _research_tool_sources(tool_name, kwargs.get("args"), kwargs.get("result"))
+        if searched or urls:
+            with _ACTIVE_ADAPTERS_LOCK:
+                for adapter in _ACTIVE_ADAPTERS:
+                    adapter.record_research_sources(kwargs.get("session_id"), searched, urls)
     _report_tool_activity(kwargs.get("session_id"), f"{label}{'失败，正在尝试其他方式' if failed else '完成'}")
+
+
+def _research_tool_sources(tool_name, args, result):
+    if tool_name not in {"web_search", "web_extract"} or not isinstance(args, dict):
+        return False, []
+    try:
+        value = json.loads(result) if isinstance(result, str) else result
+    except (ValueError, TypeError):
+        return False, []
+    if not isinstance(value, dict) or value.get("error") or value.get("success") is False:
+        return False, []
+    if tool_name == "web_search":
+        data = value.get("data")
+        query = args.get("query")
+        return bool(isinstance(query, str) and query.strip() and isinstance(data, dict) and isinstance(data.get("web"), list)), []
+    requested = args.get("urls")
+    rows = value.get("results")
+    if not isinstance(requested, list) or not isinstance(rows, list):
+        return False, []
+    urls = []
+    for row in rows[:100]:
+        if not isinstance(row, dict):
+            continue
+        url, content = row.get("url"), row.get("content")
+        if (isinstance(url, str) and len(url) <= 2000 and url in requested and _safe_public_url(url)
+                and not urlsplit(url).username and not urlsplit(url).password
+                and not row.get("error") and not row.get("blocked_by_policy") and isinstance(content, str) and content.strip()):
+            urls.append(url)
+    return False, urls
 
 
 def _report_tool_activity(session_id, content):
