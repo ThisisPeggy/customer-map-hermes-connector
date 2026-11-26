@@ -10,7 +10,7 @@ import tempfile
 import types
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from aiohttp import web
 
 ROOT = Path(__file__).parent
@@ -24,7 +24,6 @@ def _load_adapter():
     config = types.ModuleType("gateway.config")
     platforms = types.ModuleType("gateway.platforms")
     base = types.ModuleType("gateway.platforms.base")
-    weixin = types.ModuleType("gateway.platforms.weixin")
     gateway_run = types.ModuleType("gateway.run")
     gateway_session = types.ModuleType("gateway.session")
     hermes_cli = types.ModuleType("hermes_cli")
@@ -33,9 +32,6 @@ def _load_adapter():
     tools_registry = types.ModuleType("tools.registry")
     tools_send_message = types.ModuleType("tools.send_message_tool")
     tools_send_message.send_message_tool = lambda args: json.dumps({"success": True, "message_id": "wx-test"})
-    async def send_weixin_direct(**_kwargs):
-        return {"success": True, "message_id": "wx-test"}
-    weixin.send_weixin_direct = send_weixin_direct
     toolsets = types.ModuleType("toolsets")
     toolsets.TOOLSETS = {}
     toolsets.resolve_toolset = lambda name: list(toolsets.TOOLSETS.get(name, {}).get("tools", []))
@@ -95,7 +91,6 @@ def _load_adapter():
         "gateway.config": config,
         "gateway.platforms": platforms,
         "gateway.platforms.base": base,
-        "gateway.platforms.weixin": weixin,
         "gateway.run": gateway_run,
         "gateway.session": gateway_session,
         "hermes_cli": hermes_cli,
@@ -111,113 +106,15 @@ def _load_adapter():
     return module
 
 
-async def _check_secretary_notification_delivery():
-    module = _load_adapter()
-    with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {
-        "CUSTOMER_MAP_HERMES_SITE": "https://customer-map.test",
-        "CUSTOMER_MAP_HERMES_CONNECTION_ID": "test-connection",
-        "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "test-token",
-        "WEIXIN_ACCOUNT_ID": "wxid_bot", "WEIXIN_TOKEN": "weixin-test-token",
-        "WEIXIN_HOME_CHANNEL": "wxid_owner",
-    }):
-        previous_home = os.environ.get("HERMES_HOME")
-        os.environ["HERMES_HOME"] = home
-        try:
-            module.save_weixin_binding({"setupId": "b" * 32, "bindingFingerprint": module.binding_fingerprint()}, "wxid_bot", "wxid_owner")
-            adapter = module.CustomerMapAdapter({})
-            message = "早上好，今天有 3 项客户跟进。"
-            body_hash = __import__("hashlib").sha256(f"weixin\n{message}".encode()).hexdigest()
-            action = {"version": 1, "actionId": "a" * 32, "channel": "weixin", "message": message, "bodyHash": body_hash}
-            first = await adapter._run_notification_action(action)
-            second = await adapter._run_notification_action(action)
-            assert first["notificationReceipt"]["status"] == "succeeded"
-            assert first == second
-            changed_message = "changed"
-            changed_hash = __import__("hashlib").sha256(f"weixin\n{changed_message}".encode()).hexdigest()
-            changed = await adapter._run_notification_action({**action, "message": changed_message, "bodyHash": changed_hash})
-            assert changed["notificationReceipt"]["status"] == "failed"
-            assert "reused with different content" in changed["notificationReceipt"]["error"]
-        finally:
-            if previous_home is None:
-                os.environ.pop("HERMES_HOME", None)
-            else:
-                os.environ["HERMES_HOME"] = previous_home
-
-
-async def _check_secretary_file_delivery():
-    module = _load_adapter()
-    observed = {}
-
-    async def file_handler(request):
-        assert request.headers.get("Authorization") == "Bearer test-token"
-        return web.Response(body=b"%PDF-1.7\nCustomer Map", content_type="application/pdf")
-
-    app = web.Application()
-    app.router.add_get("/api/hermes-link", file_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    port = site._server.sockets[0].getsockname()[1]
-
-    async def capture_delivery(user_id, message, media_files=None):
-        observed.update(user_id=user_id, message=message, media_files=media_files)
-        assert media_files and Path(media_files[0][0]).read_bytes().startswith(b"%PDF")
-        assert Path(media_files[0][0]).name == "QT-001.pdf"
-        return {"success": True, "message_id": "wx-file-test"}
-
-    with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {
-        "HERMES_HOME": home,
-        "CUSTOMER_MAP_HERMES_SITE": f"http://127.0.0.1:{port}",
-        "CUSTOMER_MAP_HERMES_CONNECTION_ID": "test-connection",
-        "CUSTOMER_MAP_HERMES_BRIDGE_TOKEN": "test-token",
-        "WEIXIN_ACCOUNT_ID": "wxid_bot", "WEIXIN_TOKEN": "weixin-test-token",
-        "WEIXIN_HOME_CHANNEL": "wxid_owner",
-    }):
-        try:
-            module.save_weixin_binding({"setupId": "b" * 32, "bindingFingerprint": module.binding_fingerprint()}, "wxid_bot", "wxid_owner")
-            adapter = module.CustomerMapAdapter({})
-            message = "报价单文件"
-            attachment = {
-                "url": f"http://127.0.0.1:{port}/api/hermes-link?file=quote&quoteId={'c' * 36}",
-                "filename": "QT-001.pdf", "mimeType": "application/pdf",
-            }
-            hash_part = f"\n{attachment['url']}\n{attachment['filename']}\n{attachment['mimeType']}"
-            body_hash = __import__("hashlib").sha256(f"weixin\n{message}{hash_part}".encode()).hexdigest()
-            action = {"version": 2, "actionId": "d" * 32, "channel": "weixin", "message": message, "attachment": attachment, "bodyHash": body_hash}
-            with patch.object(module, "_send_weixin_notification", capture_delivery):
-                result = await adapter._run_notification_action(action)
-            assert result["notificationReceipt"]["status"] == "succeeded", result
-            assert observed["user_id"] == "wxid_owner"
-            assert not Path(observed["media_files"][0][0]).exists()
-        finally:
-            await runner.cleanup()
-
-
-async def _check_weixin_web_setup_protocol():
+async def _check_retired_wechat_jobs_do_not_reach_the_agent():
     module = _load_adapter()
     adapter = module.CustomerMapAdapter({})
-
-    async def start():
-        return {
-            "setupId": "b" * 32, "status": "waiting", "qrPayload": "https://weixin.example/qr",
-            "expiresAt": 9999999999999, "error": "", "session": object(),
-        }
-
-    async def poll(state):
-        await asyncio.sleep(0)
-        state["status"] = "connected"
-        state["qrPayload"] = ""
-
-    module._start_weixin_setup = start
-    module._poll_weixin_setup = poll
-    started = await adapter._run_weixin_setup_action({"version": 1, "action": "start"})
-    assert started["weixinSetup"]["status"] == "waiting"
-    assert started["weixinSetup"]["qrPayload"] == "https://weixin.example/qr"
-    await adapter._weixin_setup_task
-    status = await adapter._run_weixin_setup_action({"version": 1, "action": "status", "setupId": "b" * 32})
-    assert status["weixinSetup"]["status"] == "connected"
-    assert status["weixinSetup"]["qrPayload"] == ""
+    adapter.handle_message = AsyncMock()
+    adapter._complete = AsyncMock()
+    for action in ("weixinSetupAction", "notificationAction"):
+        await adapter._run_job({"id": action, "request": {action: {"version": 1}}})
+        adapter._complete.assert_awaited_with(action, error="Customer Map WeChat integration has been retired.")
+    adapter.handle_message.assert_not_awaited()
 
 
 async def _check_async_final_response():
@@ -998,7 +895,7 @@ def _check_env_write():
             assert "customer_map:" in config_text
             assert "- customer-map-readonly" in config_text
             assert "- customer-map-data" in config_text
-            assert "- customer-map-actions" in config_text
+            assert "- customer-map-actions" not in config_text
             assert "- web" in config_text
             assert "- no_mcp" in config_text
         finally:
@@ -1013,7 +910,6 @@ def _check_safe_platform_composite():
     module._register_safe_platform_toolset()
     definition = sys.modules["toolsets"].TOOLSETS["customer-map-readonly"]
     assert definition["tools"] == [
-        "customer_map_action",
         "customer_map_query",
         "mcp__my_firecrawl__firecrawl_scrape", "mcp__my_firecrawl__firecrawl_search",
         "skill_view", "skills_list", "web_extract", "web_search",
@@ -1045,9 +941,7 @@ def run_checks():
     asyncio.run(_check_himalaya_backend_mapping())
     asyncio.run(_check_mail_backend_auto_detection())
     asyncio.run(_check_persistent_mail_action_idempotency())
-    asyncio.run(_check_secretary_notification_delivery())
-    asyncio.run(_check_secretary_file_delivery())
-    asyncio.run(_check_weixin_web_setup_protocol())
+    asyncio.run(_check_retired_wechat_jobs_do_not_reach_the_agent())
     asyncio.run(_check_conversational_tool_boundary_fails_closed())
     asyncio.run(_check_rejects_stdin_body())
     asyncio.run(_check_websocket_reconnect())

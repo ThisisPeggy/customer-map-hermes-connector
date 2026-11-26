@@ -2,17 +2,15 @@
 
 This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map through an outbound WebSocket. No public Hermes port or API key is required. It reconnects automatically after temporary network or relay interruptions. Customer Map polls queued/running relay jobs automatically and can run another foreground turn when Hermes explicitly returns `continue: true`. A timed-out task is terminal and does not continue in the background.
 
-Version 0.7.0 adds the `customer_map_query` tool for live, read-only business queries from the Customer Map workspace and its authorized Weixin owner chat. Every owner-chat turn receives secretary instructions: understand text or a voice transcript as the user's request, query real records when needed, and answer directly. Translation is performed only when requested. Native Hermes still handles speech recognition and Weixin delivery; this plugin does not promise native outbound voice bubbles.
+The `customer_map_query` tool reads live business records only for requests from the paired Customer Map workspace.
 
-Successful QR authorization is saved before voice preparation and survives gateway restarts. The record is tied to the current Customer Map site, connection credential, Weixin bot, and scanning user, and contains no raw tokens or QR payload. Changing the Customer Map binding does not authorize an old Weixin recipient to read the new account. Notifications require the same binding, target that exact recipient, and deduplicate successful delivery per binding and action ID. Model-authored local attachment directives remain rejected.
+Version 0.12.2 removes the separate Customer Map WeChat setup, notifications, file delivery, and WeChat-only business tools. Use Hermes' own messaging setup for ordinary WeChat conversations. Updating does not reset native Hermes credentials or the Customer Map pairing.
 
-Version 0.9.0 accepts integrity-bound file notifications from the paired Customer Map origin. Files are downloaded with the Connector binding token into a private temporary directory, delivered to the bound Weixin owner, and deleted immediately afterward. Arbitrary URLs, redirects, unsupported file types, and files larger than 15 MB are rejected. The Connector does not send voice replies.
-
-Version 0.10.0 adds read-only discovery of connected mailboxes plus bounded inbox search and single-message reading. Only mailboxes enabled in Customer Map settings are available. Search/read never sends mail; a reply still uses the existing `mail_reply` action and requires the owner's explicit confirmation code.
+Version 0.10.0 adds read-only discovery of connected mailboxes plus bounded inbox search and single-message reading. Only mailboxes enabled in Customer Map settings are available. Search and read never send mail.
 
 Version 0.12.0 returns research evidence tied to each Customer Map request. Only the native Hermes `web_search` and `web_extract` tools supply this evidence. A URL must have been requested and successfully read; a link in model output alone is not evidence. Missing or ambiguous session bindings and missing tool evidence fail closed. This records what the tools read, not whether the source or the model's claim is true.
 
-The plugin retains SILK decoder and local speech-to-text preparation during QR setup, followed by an automatic gateway restart. Direct messages are restricted to the scanning user. Ordinary Customer Map turns retain a fail-closed allowlist, including on restored sessions: read-only business queries, confirmation-gated Customer Map actions, built-in web search/extraction, and installed skill loading. The action tool can stage customers, products, quotations, PIs, Task Assistant campaigns, email replies, and quote-file delivery; the server, not the model, validates and executes them after explicit confirmation. A configured Firecrawl MCP server contributes only `firecrawl_search` and non-interactive, public-URL `firecrawl_scrape`. The scoped `tool_search`, `tool_describe`, and `tool_call` bridge cannot bypass these checks. Terminal, arbitrary local files, code execution, delegation, kanban, cron, arbitrary MCP, memory writes, raw session search, and unconfirmed model-driven mail remain unavailable on the Customer Map platform. Native tools on unrelated Hermes platforms are not reconfigured.
+Customer Map workbench requests retain a fail-closed allowlist, including on restored sessions: read-only business queries, built-in web search and extraction, and installed skill loading. A configured Firecrawl MCP server contributes only `firecrawl_search` and non-interactive, public-URL `firecrawl_scrape`. The scoped tool bridge cannot bypass these checks, and native tools on other Hermes platforms are not reconfigured.
 
 ## Business query API
 
@@ -28,7 +26,7 @@ Deploy Customer Map's matching `/api/agent-data` implementation before using 0.7
 | `quotes` | Quotes for a customer; a quote ID includes line items |
 | `follow_ups` | Scheduled customer and quote tasks, due dates and overdue filtering |
 | `mail_activity` | Sent, detected-reply or recorded-bounce events |
-| `mailboxes` | Connected mailbox IDs, providers, addresses and secretary-search access |
+| `mailboxes` | Connected mailbox IDs, providers, addresses and access granted to Hermes |
 | `inbox_search` | Live read-only search across enabled connected inboxes; summaries only |
 | `inbox_message` | Live content for one message selected by mailbox ID and message ID |
 
@@ -36,11 +34,9 @@ Date ranges use the user's saved timezone unless explicitly overridden. Inbox se
 
 The tool checks both per-dispatch routing and Hermes' concurrent session context on every call. It refuses unrelated chats, groups, contextless calls and stale bindings, even if the tool is visible in another platform's tool catalog. It never reads data during the pre-dispatch hook, which runs before native gateway authorization.
 
-## Upgrading from 0.6.x
+## Updating
 
-Update with `hermes plugins update customer-map-platform`, then restart the intended Hermes profile. This Hermes CLI preserves an enabled plugin's state across a normal update; the user does not need a second enable command. Hermes can still disable any plugin its separate security scan blocks. Use **Authorize again / 重新扫码授权** in Customer Map's WeChat secretary settings once when upgrading an old 0.6.x authorization. No new Customer Map pairing is needed if the existing bridge binding is unchanged.
-
-WeChat's authorization page currently calls this iLink connection **OpenClaw** (`bot_type=3` in the native QR request). Hermes still handles the conversation. That name is supplied by WeChat, not this plugin's label. When WeChat displays a replacement warning, confirming the new connection disconnects the previously linked assistant for that WeChat account.
+Update with `hermes plugins update customer-map-platform`, then restart the intended Hermes profile. This preserves the existing pairing and enabled state unless Hermes' plugin security scan disables the plugin.
 
 The connector still streams Hermes response drafts, reports visible research/skill activity, and supports true task cancellation: stopping a turn cancels the matching in-flight Hermes session instead of only stopping browser polling. When Firecrawl is absent or unavailable, Hermes can continue with the built-in web tools.
 
@@ -77,7 +73,7 @@ During local development:
 
 ```bash
 mkdir -p ~/.hermes/plugins/customer-map-platform
-cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py agent_data.py operations.py secretary_context.py weixin_binding.py ~/.hermes/plugins/customer-map-platform/
+cp plugin.yaml __init__.py adapter.py connect.py mail_backends.py tool_boundary.py agent_data.py dispatch_context.py ~/.hermes/plugins/customer-map-platform/
 python3 ~/.hermes/plugins/customer-map-platform/connect.py --site https://your-customer-map.example --code CMAP-HERMES-...
 hermes gateway restart
 ```
@@ -91,8 +87,8 @@ hermes plugins list
 Run source tests independently of any installed profile (requires `aiohttp` and `PyYAML`):
 
 ```bash
-python3 -B test_secretary.py
+python3 -B test_data_context.py
 python3 -B test_plugin.py
 ```
 
-Both suites isolate profile state in temporary directories and mock messages, credentials, voice preparation and gateway restarts. The existing reconnect test additionally listens on a temporary loopback socket. No suite pairs or operates a live Hermes profile.
+These suites isolate profile state in temporary directories. The reconnect test additionally listens on a temporary loopback socket. No suite pairs or operates a live Hermes profile.

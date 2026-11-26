@@ -2,16 +2,12 @@
 
 import asyncio
 import hashlib
-import importlib
 import ipaddress
 import json
 import logging
 import os
 import re
-import shutil
 import stat
-import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -26,24 +22,19 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 
 try:
     from .agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
-    from .operations import TOOL_NAME as ACTION_TOOL_NAME, register_action_tool
+    from .dispatch_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from .mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
-    from .secretary_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from .tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
-    from .weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 except ImportError:
     from agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
-    from operations import TOOL_NAME as ACTION_TOOL_NAME, register_action_tool
+    from dispatch_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
-    from secretary_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
-    from weixin_binding import binding_fingerprint, completed_weixin_setup, load_weixin_binding, save_weixin_binding
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.12.1"
+PLUGIN_VERSION = "0.12.2"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
-NOTIFICATION_CACHE_LIMIT = 500
 TOOL_SEARCH_CATALOG_TOOLS = {"tool_search", "tool_describe"}
 _ACTIVE_ADAPTERS = set()
 _ACTIVE_ADAPTERS_LOCK = threading.Lock()
@@ -71,11 +62,6 @@ class CustomerMapAdapter(BasePlatformAdapter):
         self._job_tasks = set()
         self._mail_action_results = _load_mail_action_results()
         self._mail_action_lock = asyncio.Lock()
-        self._notification_results = _load_notification_results()
-        self._notification_lock = asyncio.Lock()
-        self._weixin_setup = None
-        self._weixin_setup_task = None
-        self._weixin_setup_lock = asyncio.Lock()
         self._loop = None
 
     @property
@@ -107,8 +93,6 @@ class CustomerMapAdapter(BasePlatformAdapter):
             self._receive_task.cancel()
         for task in list(self._job_tasks):
             task.cancel()
-        if self._weixin_setup_task:
-            self._weixin_setup_task.cancel()
         self._fail_pending("Customer Map relay disconnected")
         await self._close_transport()
         self._receive_task = self._reconnect_task = None
@@ -219,20 +203,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
             "research_sources": {"searched": False, "readUrls": []} if request.get("researchEvidenceVersion") == 2 else None,
         }
         try:
-            if request.get("weixinSetupAction") is not None:
-                response = await self._run_weixin_setup_action(request.get("weixinSetupAction"))
-                output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
-                await self._complete(job_id, response={"output_text": output_text})
-                if not completion.done():
-                    completion.set_result(output_text)
-                return
-            if request.get("notificationAction") is not None:
-                response = await self._run_notification_action(request.get("notificationAction"))
-                output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
-                await self._complete(job_id, response={"output_text": output_text})
-                if not completion.done():
-                    completion.set_result(output_text)
-                return
+            if "weixinSetupAction" in request or "notificationAction" in request:
+                raise ValueError("Customer Map WeChat integration has been retired.")
             if request.get("mailAction") is not None:
                 response = await self._run_direct_mail_action(request.get("mailAction"))
                 output_text = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
@@ -341,92 +313,6 @@ class CustomerMapAdapter(BasePlatformAdapter):
                     self._mail_action_results.pop(next(iter(self._mail_action_results)))
                 _save_mail_action_results(self._mail_action_results)
             return result
-
-    async def _run_notification_action(self, value):
-        try:
-            action = _normalize_notification_action(value)
-        except ValueError as exc:
-            return _notification_action_result(value, "failed", error=str(exc))
-        async with self._notification_lock:
-            binding = load_weixin_binding()
-            if not binding:
-                return _notification_action_result(action, "failed", error="请在 Customer Map 重新扫码授权微信，确认此账号的秘书消息接收人。")
-            cache_id = hashlib.sha256(f"{binding['fingerprint']}:{binding['accountId']}:{binding['userId']}:{action['actionId']}".encode()).hexdigest()[:32]
-            cached = self._notification_results.get(cache_id)
-            if cached:
-                if cached["bodyHash"] != action["bodyHash"]:
-                    return _notification_action_result(action, "failed", error="Notification action id was reused with different content.")
-                return cached["result"]
-            temporary_directory = ""
-            try:
-                media_files = None
-                if action.get("attachment"):
-                    temporary_directory, attachment_path = await _download_notification_attachment(
-                        self._http, self.site, self.bridge_token, action["attachment"],
-                    )
-                    media_files = [(attachment_path, False)]
-                delivered = await _send_weixin_notification(binding["userId"], action["message"], media_files)
-                if not isinstance(delivered, dict) or delivered.get("success") is not True:
-                    raise RuntimeError(str((delivered or {}).get("error") if isinstance(delivered, dict) else delivered) or "Weixin delivery failed.")
-                result = _notification_action_result(action, "succeeded", message_id=str(delivered.get("message_id") or ""))
-            except Exception as exc:
-                result = _notification_action_result(action, "failed", error=str(exc))
-            finally:
-                if temporary_directory:
-                    shutil.rmtree(temporary_directory, ignore_errors=True)
-            if result["notificationReceipt"]["status"] == "succeeded":
-                self._notification_results[cache_id] = {"bodyHash": action["bodyHash"], "result": result}
-                while len(self._notification_results) > NOTIFICATION_CACHE_LIMIT:
-                    self._notification_results.pop(next(iter(self._notification_results)))
-                _save_notification_results(self._notification_results)
-            return result
-
-    async def _run_weixin_setup_action(self, value):
-        async with self._weixin_setup_lock:
-            return await self._apply_weixin_setup_action(value)
-
-    async def _apply_weixin_setup_action(self, value):
-        action = value if isinstance(value, dict) else {}
-        if action.get("version") != 1:
-            return _weixin_setup_result("failed", error="Unsupported Weixin setup version.")
-        kind = str(action.get("action") or "status").strip().lower()
-        setup_id = str(action.get("setupId") or "").strip().lower()
-        if setup_id and not re.fullmatch(r"[0-9a-f]{32}", setup_id):
-            return _weixin_setup_result("failed", error="Invalid Weixin setup id.")
-        if kind == "start":
-            fingerprint = binding_fingerprint()
-            if not fingerprint:
-                return _weixin_setup_result("failed", error="Pair Customer Map before authorizing Weixin.")
-            if self._weixin_setup_task and not self._weixin_setup_task.done():
-                self._weixin_setup_task.cancel()
-                await asyncio.gather(self._weixin_setup_task, return_exceptions=True)
-            self._weixin_setup = None
-            self._weixin_setup = await _start_weixin_setup()
-            self._weixin_setup["bindingFingerprint"] = fingerprint
-            self._weixin_setup_task = asyncio.create_task(_poll_weixin_setup(self._weixin_setup))
-        elif kind == "cancel":
-            state = self._weixin_setup
-            if state and (not setup_id or setup_id == state["setupId"]) and state["status"] not in {"preparing", "connected"}:
-                if self._weixin_setup_task:
-                    self._weixin_setup_task.cancel()
-                    await asyncio.gather(self._weixin_setup_task, return_exceptions=True)
-                self._weixin_setup_task = None
-                self._weixin_setup = None
-                return _weixin_setup_result("cancelled", setup_id=state["setupId"])
-            # A stale browser tab cannot cancel a newer setup or revoke a
-            # completed authorization by cancelling its polling request.
-        elif kind != "status":
-            return _weixin_setup_result("failed", error="Unknown Weixin setup action.")
-        state = self._weixin_setup
-        if not state or (setup_id and setup_id != state["setupId"]):
-            state = completed_weixin_setup(setup_id)
-        if not state:
-            return _weixin_setup_result("missing", error="Weixin setup session was not found.")
-        return _weixin_setup_result(
-            state["status"], setup_id=state["setupId"], qr_payload=state.get("qrPayload", ""),
-            expires_at=state.get("expiresAt", 0), error=state.get("error", ""),
-            voice_ready=state.get("voiceReady"),
-        )
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         pending = self._pending.get(str(chat_id))
@@ -568,11 +454,8 @@ def _capabilities():
         "mailBackendMode": configured_mail_backend(),
         "conversationalToolBoundary": "research-read-only",
         "memory": "unknown",
-        "secretaryNotification": "verified",
-        "weixinWebSetup": "verified",
         "agentDataQuery": "supported",
         "agentDataApiVersion": 1,
-        "weixinDataBinding": "verified" if load_weixin_binding() else "unbound",
         "researchEvidenceVersion": 2,
     }
 
@@ -593,12 +476,8 @@ def _on_pre_tool_call(**kwargs):
     target = str(args.get("name") or "") if tool_name == "tool_call" else tool_name
     context = current_data_context()
     customer_map_session = is_customer_map_turn() or str(kwargs.get("session_id") or "") in _CUSTOMER_MAP_SESSIONS
-    if target in {DATA_TOOL_NAME, ACTION_TOOL_NAME} and not context:
-        return {"action": "block", "message": "Customer Map data and actions are not authorized for this chat. Authorize the Weixin owner from Customer Map first."}
-    # The authorized Weixin owner is a Customer Map business turn too.  It
-    # must receive the same fail-closed tool boundary as relay-originated
-    # Customer Map sessions; otherwise core artifact/file tools can fabricate
-    # a document that was never created in Customer Map.
+    if target == DATA_TOOL_NAME and not context:
+        return {"action": "block", "message": "Customer Map data is only available to requests from the paired workspace."}
     if not context and not customer_map_session:
         return
     if tool_name in TOOL_SEARCH_CATALOG_TOOLS:
@@ -719,9 +598,6 @@ def _tool_activity(tool_name, args):
     args = args if isinstance(args, dict) else {}
     if tool_name == DATA_TOOL_NAME:
         return "正在查询 Customer Map 业务数据"
-    if tool_name == ACTION_TOOL_NAME:
-        kind = str(args.get("kind") or "").strip().lower()
-        return "正在执行已确认的 Customer Map 操作" if kind == "confirm" else "正在准备 Customer Map 操作确认"
     if tool_name == "tool_search":
         return "正在加载可用工具"
     if tool_name == "web_search":
@@ -752,7 +628,6 @@ def _env_enablement():
 
 def register(ctx):
     register_data_tool(ctx, _enabled)
-    register_action_tool(ctx, _enabled)
     _register_safe_platform_toolset()
     ctx.register_platform(
         name="customer_map",
@@ -823,304 +698,6 @@ def _normalize_mail_action(value):
         "plainTextBody": plain_text,
         "htmlBody": html_body,
         "bodyHash": body_hash,
-    }
-
-
-def _normalize_notification_action(value):
-    if not isinstance(value, dict) or value.get("version") not in (1, 2):
-        raise ValueError("Unsupported Customer Map notification version.")
-    action_id = str(value.get("actionId") or "").strip().lower()
-    channel = str(value.get("channel") or "").strip().lower()
-    message = str(value.get("message") or "").strip()
-    body_hash = str(value.get("bodyHash") or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{32}", action_id):
-        raise ValueError("Invalid Customer Map notification action id.")
-    if channel != "weixin":
-        raise ValueError("Customer Map secretary notifications may only use the Weixin home channel.")
-    if not message or len(message) > 12000:
-        raise ValueError("Customer Map notification is empty or too large.")
-    if re.search(r"MEDIA\s*:", message, re.IGNORECASE):
-        raise ValueError("Customer Map secretary notifications are text-only; attachment directives are not allowed.")
-    attachment = None
-    attachment_hash_part = ""
-    if value.get("version") == 2:
-        raw_attachment = value.get("attachment")
-        if not isinstance(raw_attachment, dict):
-            raise ValueError("Customer Map file notification is missing its attachment.")
-        url = str(raw_attachment.get("url") or "").strip()
-        filename = Path(str(raw_attachment.get("filename") or "")).name
-        mime_type = str(raw_attachment.get("mimeType") or "").strip().lower()
-        if not url or not filename or filename != str(raw_attachment.get("filename") or ""):
-            raise ValueError("Customer Map file attachment metadata is invalid.")
-        if not re.fullmatch(r"[A-Za-z0-9._ -]{1,120}", filename):
-            raise ValueError("Customer Map file name is invalid.")
-        if mime_type not in {"application/pdf", "text/csv", "text/plain", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}:
-            raise ValueError("Customer Map file type is not allowed.")
-        attachment = {"url": url, "filename": filename, "mimeType": mime_type}
-        attachment_hash_part = f"\n{url}\n{filename}\n{mime_type}"
-    elif value.get("attachment") is not None:
-        raise ValueError("Customer Map notification version does not support attachments.")
-    expected_hash = hashlib.sha256(f"{channel}\n{message}{attachment_hash_part}".encode("utf-8")).hexdigest()
-    if body_hash != expected_hash:
-        raise ValueError("Notification body integrity check failed.")
-    return {"version": value.get("version"), "actionId": action_id, "channel": channel, "message": message, "attachment": attachment, "bodyHash": body_hash}
-
-
-async def _download_notification_attachment(session, site, bridge_token, attachment):
-    from urllib.parse import urlparse
-
-    expected_origin = urlparse(site)
-    attachment_url = urlparse(attachment["url"])
-    if (attachment_url.scheme, attachment_url.netloc) != (expected_origin.scheme, expected_origin.netloc):
-        raise ValueError("Customer Map attachment URL does not match the paired site.")
-    if attachment_url.path != "/api/hermes-link" or attachment_url.username or attachment_url.password or attachment_url.fragment:
-        raise ValueError("Customer Map attachment URL is not allowed.")
-    own_session = session is None or session.closed
-    client = ClientSession(timeout=ClientTimeout(total=45)) if own_session else session
-    directory = tempfile.mkdtemp(prefix="customer-map-file-")
-    path = str(Path(directory) / attachment["filename"])
-    try:
-        async with client.get(
-            attachment["url"],
-            headers={"Authorization": f"Bearer {bridge_token}", "Accept": attachment["mimeType"]},
-            allow_redirects=False,
-            timeout=ClientTimeout(total=45),
-        ) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Customer Map file download failed with HTTP {response.status}.")
-            content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-            if content_type != attachment["mimeType"]:
-                raise RuntimeError("Customer Map file type did not match its attachment metadata.")
-            declared = int(response.headers.get("Content-Length") or 0)
-            if declared < 0 or declared > 15_000_000:
-                raise RuntimeError("Customer Map file is too large for Weixin delivery.")
-            total = 0
-            with open(path, "wb") as handle:
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    total += len(chunk)
-                    if total > 15_000_000:
-                        raise RuntimeError("Customer Map file is too large for Weixin delivery.")
-                    handle.write(chunk)
-            if total == 0:
-                raise RuntimeError("Customer Map returned an empty file.")
-        return directory, path
-    except Exception:
-        shutil.rmtree(directory, ignore_errors=True)
-        raise
-    finally:
-        if own_session:
-            await client.close()
-
-
-async def _send_weixin_notification(user_id, message, media_files=None):
-    """Send on the gateway loop so the live Weixin adapter and its context token can be reused."""
-    from gateway.platforms import weixin
-
-    extra = {
-        "account_id": os.getenv("WEIXIN_ACCOUNT_ID", ""),
-        "base_url": os.getenv("WEIXIN_BASE_URL", ""),
-        "cdn_base_url": os.getenv("WEIXIN_CDN_BASE_URL", ""),
-    }
-    token = os.getenv("WEIXIN_TOKEN", "")
-    delivered = await weixin.send_weixin_direct(
-        extra=extra,
-        token=token,
-        chat_id=user_id,
-        message=message,
-        media_files=media_files,
-    )
-    # Hermes' native Weixin adapter retries expired context tokens for text,
-    # but not for documents.  A Customer Map PDF therefore used to fail after
-    # a perfectly valid quote had been generated.  Drop only this peer's
-    # stale in-memory token and retry the attachment without the already-sent
-    # text; no business operation or local substitute file is created.
-    if media_files and isinstance(delivered, dict) and delivered.get("success") is not True:
-        await _clear_weixin_context_token(extra["account_id"], user_id)
-        retry = await weixin.send_weixin_direct(
-            extra=extra,
-            token=token,
-            chat_id=user_id,
-            message="",
-            media_files=media_files,
-        )
-        if isinstance(retry, dict) and retry.get("success") is True:
-            return retry
-        return {"error": f"{str(delivered.get('error') or 'Weixin media send failed.')[:400]} Retry without the expired Weixin session also failed: {str((retry or {}).get('error') if isinstance(retry, dict) else retry)[:400]}"}
-    return delivered
-
-
-async def _clear_weixin_context_token(account_id, user_id):
-    """Remove one stale persisted iLink token before a document-only retry."""
-    if not account_id or not user_id:
-        return
-    try:
-        from gateway.platforms.weixin import ContextTokenStore
-        from hermes_constants import get_hermes_home
-        store = ContextTokenStore(str(get_hermes_home()))
-        store.restore(account_id)
-        key = store._key(account_id, user_id)
-        async with store._persist_lock:
-            if key not in store._cache:
-                return
-            store._cache.pop(key, None)
-            prefix = f"{account_id}:"
-            payload = {saved_key[len(prefix):]: value for saved_key, value in store._cache.items() if saved_key.startswith(prefix)}
-            await asyncio.to_thread(store._persist, account_id, payload)
-    except Exception as exc:
-        logger.warning("Could not clear stale Weixin context token before Customer Map file retry: %s", exc)
-
-
-async def _start_weixin_setup():
-    from gateway.platforms.weixin import (
-        EP_GET_BOT_QR, ILINK_BASE_URL, QR_TIMEOUT_MS, _api_get, _make_ssl_connector,
-    )
-    session = ClientSession(trust_env=True, connector=_make_ssl_connector())
-    try:
-        payload = await _api_get(
-            session, base_url=ILINK_BASE_URL,
-            endpoint=f"{EP_GET_BOT_QR}?bot_type=3", timeout_ms=QR_TIMEOUT_MS,
-        )
-        qrcode_value = str(payload.get("qrcode") or "").strip()
-        qr_payload = str(payload.get("qrcode_img_content") or qrcode_value).strip()
-        if not qrcode_value or not qr_payload:
-            raise RuntimeError("Weixin did not return a QR code.")
-        return {
-            "setupId": uuid.uuid4().hex,
-            "status": "waiting",
-            "qrPayload": qr_payload,
-            "qrcode": qrcode_value,
-            "baseUrl": ILINK_BASE_URL,
-            "expiresAt": int((time.time() + 480) * 1000),
-            "session": session,
-            "error": "",
-        }
-    except Exception:
-        await session.close()
-        raise
-
-
-async def _poll_weixin_setup(state):
-    from gateway.platforms.weixin import EP_GET_QR_STATUS, ILINK_BASE_URL, QR_TIMEOUT_MS, _api_get, save_weixin_account
-    from hermes_cli.config import get_hermes_home, save_env_value
-    session = state["session"]
-    try:
-        while time.time() * 1000 < state["expiresAt"]:
-            payload = await _api_get(
-                session, base_url=state.get("baseUrl") or ILINK_BASE_URL,
-                endpoint=f"{EP_GET_QR_STATUS}?qrcode={state['qrcode']}", timeout_ms=QR_TIMEOUT_MS,
-            )
-            status = str(payload.get("status") or "wait")
-            if status == "scaned":
-                state["status"] = "scanned"
-            elif status == "scaned_but_redirect":
-                redirect_host = str(payload.get("redirect_host") or "").strip()
-                if redirect_host:
-                    state["baseUrl"] = f"https://{redirect_host}"
-            elif status == "confirmed":
-                account_id = str(payload.get("ilink_bot_id") or "").strip()
-                token = str(payload.get("bot_token") or "").strip()
-                base_url = str(payload.get("baseurl") or state.get("baseUrl") or ILINK_BASE_URL).strip()
-                user_id = str(payload.get("ilink_user_id") or "").strip()
-                if not account_id or not token or not user_id:
-                    raise RuntimeError("Weixin confirmed the QR code but returned incomplete credentials.")
-                if state.get("bindingFingerprint") != binding_fingerprint():
-                    raise RuntimeError("Customer Map binding changed during Weixin authorization. Start again.")
-                save_weixin_account(str(get_hermes_home()), account_id=account_id, token=token, base_url=base_url, user_id=user_id)
-                values = {
-                    "WEIXIN_ACCOUNT_ID": account_id,
-                    "WEIXIN_TOKEN": token,
-                    "WEIXIN_BASE_URL": base_url,
-                    "WEIXIN_CDN_BASE_URL": "https://novac2c.cdn.weixin.qq.com/c2c",
-                    "WEIXIN_DM_POLICY": "allowlist",
-                    "WEIXIN_ALLOW_ALL_USERS": "false",
-                    "WEIXIN_ALLOWED_USERS": user_id,
-                    "WEIXIN_GROUP_POLICY": "disabled",
-                    "WEIXIN_GROUP_ALLOWED_USERS": "",
-                    "WEIXIN_HOME_CHANNEL": user_id,
-                    "WEIXIN_HOME_CHANNEL_NAME": "Customer Map Secretary",
-                }
-                for key, value in values.items():
-                    save_env_value(key, value)
-                    os.environ[key] = value
-                state["status"] = "preparing"
-                # Persist authorization before dependency preparation so a
-                # restart at any later point cannot lose the successful scan.
-                save_weixin_binding(state, account_id, user_id)
-                try:
-                    await asyncio.to_thread(_prepare_weixin_voice_support)
-                    state["voiceReady"] = True
-                except Exception as exc:
-                    logger.warning("Weixin voice support setup failed: %s", exc)
-                    state["voiceReady"] = False
-                    state["voiceError"] = str(exc)[:500]
-                save_weixin_binding(state, account_id, user_id)
-                state["status"] = "connected"
-                state["qrPayload"] = ""
-                asyncio.create_task(_restart_gateway_after_weixin_setup())
-                return
-            elif status == "expired":
-                state["status"] = "expired"
-                state["error"] = "Weixin QR code expired. Start again."
-                return
-            await asyncio.sleep(1)
-        state["status"] = "expired"
-        state["error"] = "Weixin QR code expired. Start again."
-    except asyncio.CancelledError:
-        state["status"] = "cancelled"
-        raise
-    except Exception as exc:
-        state["status"] = "failed"
-        state["error"] = str(exc)[:500]
-    finally:
-        state.pop("session", None)
-        await session.close()
-
-
-def _weixin_setup_result(status, setup_id="", qr_payload="", expires_at=0, error="", voice_ready=None):
-    return {
-        "weixinSetup": {
-            "status": status, "setupId": setup_id, "qrPayload": qr_payload,
-            "expiresAt": expires_at, "error": error,
-            **({"voiceReady": voice_ready} if isinstance(voice_ready, bool) else {}),
-        }
-    }
-
-
-def _prepare_weixin_voice_support():
-    """Install Hermes' pinned local Weixin voice decoder and STT fallback."""
-    from tools.lazy_deps import ensure
-    ensure("stt.silk", prompt=False)
-    ensure("stt.faster_whisper", prompt=False)
-    importlib.invalidate_caches()
-
-
-async def _restart_gateway_after_weixin_setup():
-    """Reload the newly configured inbound adapter after the web response lands."""
-    await asyncio.sleep(8)
-    hermes = Path(sys.executable).with_name("hermes")
-    command = [str(hermes if hermes.is_file() else "hermes"), "gateway", "restart"]
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-    if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        subprocess.Popen(command, **kwargs)
-    except Exception as exc:
-        logger.warning("Automatic Hermes gateway restart after Weixin setup failed: %s", exc)
-
-
-def _notification_action_result(value, status, message_id="", error=""):
-    source = value if isinstance(value, dict) else {}
-    return {
-        "reply": "微信秘书简报已投递。" if status == "succeeded" else error,
-        "notificationReceipt": {
-            "kind": "secretaryBriefing", "status": status, "channel": "weixin",
-            "messageId": message_id, "error": error,
-            "bodyHash": str(source.get("bodyHash") or ""),
-            "actionId": str(source.get("actionId") or ""),
-            "occurredAt": datetime.now(timezone.utc).isoformat() if status == "succeeded" else "",
-        },
     }
 
 
@@ -1219,50 +796,6 @@ def _save_mail_action_results(results):
             json.dump(results, handle, ensure_ascii=False, separators=(",", ":"))
             handle.write("\n")
         os.chmod(temp_path, mode)
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-
-def _notification_cache_path():
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / ".customer-map-notifications.json"
-
-
-def _load_notification_results():
-    path = _notification_cache_path()
-    try:
-        value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except Exception as exc:
-        logger.warning("Could not read Customer Map notification cache: %s", exc)
-        return {}
-    if not isinstance(value, dict):
-        return {}
-    results = {}
-    for action_id, entry in list(value.items())[-NOTIFICATION_CACHE_LIMIT:]:
-        if not re.fullmatch(r"[0-9a-f]{32}", str(action_id)) or not isinstance(entry, dict):
-            continue
-        body_hash = str(entry.get("bodyHash") or "")
-        result = entry.get("result")
-        receipt = result.get("notificationReceipt") if isinstance(result, dict) else None
-        if not re.fullmatch(r"[0-9a-f]{64}", body_hash) or not isinstance(receipt, dict):
-            continue
-        if receipt.get("status") != "succeeded" or receipt.get("channel") != "weixin":
-            continue
-        results[str(action_id)] = {"bodyHash": body_hash, "result": result}
-    return results
-
-
-def _save_notification_results(results):
-    path = _notification_cache_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(results, handle, ensure_ascii=False, separators=(",", ":"))
-            handle.write("\n")
-        os.chmod(temp_path, 0o600)
         os.replace(temp_path, path)
     finally:
         if os.path.exists(temp_path):

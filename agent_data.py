@@ -8,18 +8,18 @@ import urllib.request
 from urllib.parse import urlsplit
 
 try:
-    from .secretary_context import current_data_context
+    from .dispatch_context import current_data_context
 except ImportError:
-    from secretary_context import current_data_context
+    from dispatch_context import current_data_context
 
 
 DATA_TOOLSET = "customer-map-data"
 TOOL_NAME = "customer_map_query"
-OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "product_lists", "quotes", "follow_ups", "mail_activity", "mailboxes", "inbox_search", "inbox_message", "exchange_rate_chart")
+OPERATIONS = ("capabilities", "work_summary", "customers", "customer_detail", "product_lists", "quotes", "follow_ups", "mail_activity", "mailboxes", "inbox_search", "inbox_message")
 MAX_RESPONSE_BYTES = 512_000
 QUERY_SCHEMA = {
     "name": TOOL_NAME,
-    "description": "Read the bound user's Customer Map records and authorized connected inboxes. Use mailboxes to discover connected accounts, inbox_search for bounded read-only search, inbox_message to read one selected message, and exchange_rate_chart when the owner asks to generate and send the current exchange-rate chart to Weixin. Honor period, metric definitions, and source coverage; unavailable is not zero. Inbox reads never send mail.",
+    "description": "Read the bound user's Customer Map records and authorized connected inboxes. Use mailboxes to discover connected accounts, inbox_search for bounded read-only search, and inbox_message to read one selected message. Honor period, metric definitions, and source coverage; unavailable is not zero. Inbox reads never send mail.",
     "parameters": {
         "type": "object", "additionalProperties": False, "required": ["operation"],
         "properties": {
@@ -27,7 +27,7 @@ QUERY_SCHEMA = {
             "period": {"type": "string", "enum": ["today", "yesterday", "tomorrow", "last7days", "last30days", "custom", "all"], "description": "Defaults to today for work_summary/mail_activity/follow_ups, last30days for inbox_search, and all for lists. Custom requires from and through. Capabilities, customer_detail, mailboxes and inbox_message have no date filter. Future periods are only meaningful for follow-ups; summary cannot use all."},
             "from": {"type": "string", "description": "Inclusive YYYY-MM-DD for a custom period (at most one year)."},
             "through": {"type": "string", "description": "Inclusive YYYY-MM-DD for a custom period."},
-            "timezone": {"type": "string", "description": "IANA timezone; omit to use the user's secretary settings."},
+            "timezone": {"type": "string", "description": "IANA timezone; omit to use the account's default."},
             "search": {"type": "string", "maxLength": 160, "description": "Company substring for customers/quotes, or sender/subject/body terms for inbox_search."},
             "country": {"type": "string", "maxLength": 100, "description": "Exact saved country value; customers only."},
             "customerId": {"type": "string", "maxLength": 160, "description": "Real ID from customers. Required for customer_detail; optional for work_summary, quotes, follow_ups, mail_activity."},
@@ -70,7 +70,7 @@ def _failure(code, message):
 
 def customer_map_query(args, **_kwargs):
     if not current_data_context():
-        return _failure("data_access_denied", "Customer Map data is available only in its authenticated workspace or the Weixin owner chat authorized for this binding. Open Customer Map's Weixin setup and scan again after upgrading from 0.6.x.")
+        return _failure("data_access_denied", "Customer Map data is available only to requests from the paired workspace.")
     if not isinstance(args, dict) or args.get("operation") not in OPERATIONS:
         return _failure("invalid_query", "Choose a supported Customer Map query operation.")
     if set(args) - set(QUERY_SCHEMA["parameters"]["properties"]):
