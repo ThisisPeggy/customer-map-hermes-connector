@@ -984,12 +984,17 @@ def _check_env_write():
         previous = os.environ.get("HERMES_HOME")
         os.environ["HERMES_HOME"] = directory
         try:
+            path = "D:\\" + "a" * 68 + "\\日本語 content with newline\n\\folder\\child"
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(json.dumps({"terminal": {"cwd": path}}, ensure_ascii=False), encoding="utf-8")
             module._write_env({"CUSTOMER_MAP_HERMES_SITE": "https://example.com", "CUSTOMER_MAP_HERMES_CONNECTION_ID": "abc"})
             module.ensure_customer_map_tool_boundary()
             text = (Path(directory) / ".env").read_text(encoding="utf-8")
             assert "CUSTOMER_MAP_HERMES_SITE=https://example.com" in text
             assert "CUSTOMER_MAP_HERMES_CONNECTION_ID=abc" in text
             config_text = (Path(directory) / "config.yaml").read_text(encoding="utf-8")
+            parser = "hermes_yaml" if importlib.util.find_spec("hermes_yaml") else "yaml"
+            assert __import__(parser).safe_load(config_text)["terminal"]["cwd"] == path
             assert "customer_map:" in config_text
             assert "- customer-map-readonly" in config_text
             assert "- customer-map-data" in config_text

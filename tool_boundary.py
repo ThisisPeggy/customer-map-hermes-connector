@@ -70,9 +70,14 @@ def _registered_firecrawl_read_tools():
 def ensure_customer_map_tool_boundary():
     """Persist Customer Map's read-only research allowlist."""
     try:
-        import yaml
-    except ImportError as exc:
-        raise RuntimeError("PyYAML is required to configure Hermes tool isolation.") from exc
+        import hermes_yaml as yaml
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_yaml":
+            raise
+        try:
+            import yaml
+        except ImportError as exc:
+            raise RuntimeError("Use the Hermes Gateway Python environment or install PyYAML for standalone pairing.") from exc
 
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     home.mkdir(parents=True, exist_ok=True)
@@ -107,7 +112,8 @@ def ensure_customer_map_tool_boundary():
     known.update(discovered)
     known_map["customer_map"] = sorted(known)
 
-    serialized = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+    # Folding a quoted path after an escaped backslash can change its value in ruamel.yaml.
+    serialized = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, width=2**31 - 1)
     current = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     if current == serialized:
         return False

@@ -71,6 +71,8 @@ hermes plugins update customer-map-platform
 hermes gateway restart
 ```
 
+Connector 0.12.1 uses Hermes' built-in YAML support when available. If your Gateway runs without PyYAML, update the Connector and restart Gateway; an existing pairing is kept.
+
 During local development:
 
 ```bash
