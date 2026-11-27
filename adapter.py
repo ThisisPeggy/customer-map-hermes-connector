@@ -22,17 +22,17 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 
 try:
     from .agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
-    from .dispatch_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
+    from .dispatch_context import authenticated_workspace_source, current_data_context, is_customer_map_turn, on_gateway_dispatch
     from .mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from .tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 except ImportError:
     from agent_data import TOOL_NAME as DATA_TOOL_NAME, register_data_tool
-    from dispatch_context import current_data_context, is_customer_map_turn, on_gateway_dispatch
+    from dispatch_context import authenticated_workspace_source, current_data_context, is_customer_map_turn, on_gateway_dispatch
     from mail_backends import configured_mail_backend, execute_mail_action, mail_backend_capability
     from tool_boundary import allowed_effective_tools, assert_customer_map_tool_boundary, ensure_customer_map_tool_boundary, firecrawl_operation, register_customer_map_toolset
 
 logger = logging.getLogger(__name__)
-PLUGIN_VERSION = "0.12.2"
+PLUGIN_VERSION = "0.12.3"
 MAX_MAIL_BODY_BYTES = 100000
 MAIL_ACTION_CACHE_LIMIT = 200
 TOOL_SEARCH_CATALOG_TOOLS = {"tool_search", "tool_describe"}
@@ -67,6 +67,11 @@ class CustomerMapAdapter(BasePlatformAdapter):
     @property
     def name(self):
         return "Customer Map"
+
+    @property
+    def authorization_is_upstream(self) -> bool:
+        # The paired Customer Map socket authorizes jobs before this native platform admits them.
+        return True
 
     async def connect(self, *, is_reconnect=False):
         self._stopping = False
@@ -221,7 +226,6 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 user_id=str(request.get("sessionKey") or "customer-map"),
                 user_name="Customer Map user",
             )
-            source.delivered_via_upstream_relay = True
             from gateway.session import build_session_key
             session_store = getattr(self, "_session_store", None)
             extra = getattr(self.config, "extra", {}) or {}
@@ -249,7 +253,8 @@ class CustomerMapAdapter(BasePlatformAdapter):
                 message_id=job_id,
                 timestamp=datetime.now(),
             )
-            await self.handle_message(event)
+            with authenticated_workspace_source(source):
+                await self.handle_message(event)
             timeout_seconds = max(5, min(float(job.get("timeoutMs") or 120000) / 1000 - 2, 598))
             await asyncio.wait_for(completion, timeout=timeout_seconds)
         except asyncio.TimeoutError:

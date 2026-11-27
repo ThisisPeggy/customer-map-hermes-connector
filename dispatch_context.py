@@ -3,10 +3,12 @@
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 
 _DISPATCH = ContextVar("customer_map_dispatch", default=None)
+_AUTHENTICATED_SOURCE = ContextVar("customer_map_authenticated_source", default=None)
 
 
 def _binding_fingerprint():
@@ -19,8 +21,17 @@ def _binding_fingerprint():
     return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
 
 
+@contextmanager
+def authenticated_workspace_source(source):
+    token = _AUTHENTICATED_SOURCE.set(source)
+    try:
+        yield
+    finally:
+        _AUTHENTICATED_SOURCE.reset(token)
+
+
 def on_gateway_dispatch(**kwargs):
-    # Capture the relay dispatch before native authorization; do not read data here.
+    # Capture the connector's authenticated job before native authorization; do not read data here.
     _DISPATCH.set(None)
     event = kwargs.get("event")
     source = getattr(event, "source", None)
@@ -28,7 +39,7 @@ def on_gateway_dispatch(**kwargs):
         return
     platform = getattr(source, "platform", None)
     platform = str(getattr(platform, "value", platform) or "")
-    if platform != "customer_map" or not getattr(source, "delivered_via_upstream_relay", False):
+    if platform != "customer_map" or source is not _AUTHENTICATED_SOURCE.get():
         return
     chat_id = str(getattr(source, "chat_id", "") or "")
     user_id = str(getattr(source, "user_id", "") or "")

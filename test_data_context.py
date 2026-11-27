@@ -46,15 +46,16 @@ class DataContextTests(unittest.TestCase):
         self.env.stop()
         self.home.cleanup()
 
-    def event(self, platform="customer_map", chat_id="cm-chat", user_id="cm-user", chat_type="dm", relay=True):
+    def event(self, platform="customer_map", chat_id="cm-chat", user_id="cm-user", chat_type="dm"):
         return types.SimpleNamespace(source=types.SimpleNamespace(
             platform=platform, chat_id=chat_id, user_id=user_id, chat_type=chat_type,
-            delivered_via_upstream_relay=relay,
+            delivered_via_upstream_relay=False,
         ), channel_prompt="Existing channel instructions", text="今天报价多少？", internal=False)
 
-    def dispatch(self, event):
-        context.on_gateway_dispatch(event=event)
+    def dispatch(self, event, *, authenticated=True):
         source = event.source
+        with context.authenticated_workspace_source(source if authenticated else None):
+            context.on_gateway_dispatch(event=event)
         _SESSION.set({
             "HERMES_SESSION_PLATFORM": source.platform,
             "HERMES_SESSION_CHAT_ID": source.chat_id,
@@ -66,7 +67,7 @@ class DataContextTests(unittest.TestCase):
         self.dispatch(self.event())
 
     def test_other_platforms_groups_and_untrusted_dispatches_are_untouched(self):
-        events = [self.event(platform="weixin"), self.event(chat_type="group"), self.event(platform="telegram"), self.event(relay=False)]
+        events = [self.event(platform="weixin"), self.event(chat_type="group"), self.event(platform="telegram")]
         internal = self.event()
         internal.internal = True
         events.append(internal)
@@ -75,6 +76,10 @@ class DataContextTests(unittest.TestCase):
                 self.dispatch(event)
                 self.assertIsNone(context.current_data_context())
                 self.assertEqual(event.channel_prompt, "Existing channel instructions")
+        untrusted = self.event()
+        untrusted.source.delivered_via_upstream_relay = True
+        self.dispatch(untrusted, authenticated=False)
+        self.assertIsNone(context.current_data_context())
 
     def test_native_context_and_dispatch_must_agree(self):
         self.authorize()
@@ -109,7 +114,7 @@ class DataContextTests(unittest.TestCase):
         self.assertIsNone(self.adapter_module._on_pre_tool_call(session_id="restored", tool_name="customer_map_query", args={"operation": "customers"}))
 
     def test_restored_customer_map_sessions_keep_mail_and_terminal_blocked(self):
-        self.dispatch(self.event(platform="customer_map", chat_id="cm-chat", user_id="cm-user", relay=True))
+        self.dispatch(self.event())
         self.assertTrue(context.is_customer_map_turn())
         for name in ("terminal", "send_email", "send_message", "delegate_task"):
             result = self.adapter_module._on_pre_tool_call(session_id="not-seen-at-start", tool_name=name, args={})

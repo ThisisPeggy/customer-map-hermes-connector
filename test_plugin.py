@@ -133,6 +133,8 @@ async def _check_async_final_response():
     adapter._ws = WebSocket()
 
     async def handle_message(event):
+        assert adapter.authorization_is_upstream is True
+        assert not event.source.delivered_via_upstream_relay
         async def respond():
             await asyncio.sleep(0)
             await adapter.send(event.source.chat_id, "progress", metadata={})

@@ -4,6 +4,8 @@ This Hermes platform plugin connects a user-owned Hermes Agent to Customer Map t
 
 The `customer_map_query` tool reads live business records only for requests from the paired Customer Map workspace.
 
+Version 0.12.3 fixes a Gateway ingress error where the connector showed as online, but chat requests were rejected before reaching the model. Update the connector and restart the same Gateway; the existing pairing is preserved.
+
 Version 0.12.2 removes the separate Customer Map WeChat setup, notifications, file delivery, and WeChat-only business tools. Use Hermes' own messaging setup for ordinary WeChat conversations. Updating does not reset native Hermes credentials or the Customer Map pairing.
 
 Version 0.10.0 adds read-only discovery of connected mailboxes plus bounded inbox search and single-message reading. Only mailboxes enabled in Customer Map settings are available. Search and read never send mail.
